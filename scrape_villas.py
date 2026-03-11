@@ -11,7 +11,6 @@ import json
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
 
@@ -304,6 +303,32 @@ def _rumah123_headers() -> dict:
 # Rumah123
 # ---------------------------------------------------------------------------
 
+# When security verification is detected in headless, wait this many seconds before
+# giving up and retrying with a visible browser (so the real browser kicks in quickly).
+RUMAH123_SECURITY_RETRY_SEC = 15
+
+# Target zone for the verification checkbox only (viewport 1920x1080).
+# Zone shifted so center is ~20px to the right of the checkbox center (per calibration).
+RUMAH123_VERIFICATION_CLICK_X_MIN = 520
+RUMAH123_VERIFICATION_CLICK_X_MAX = 600
+RUMAH123_VERIFICATION_CLICK_Y_MIN = 310
+RUMAH123_VERIFICATION_CLICK_Y_MAX = 350
+RUMAH123_VERIFICATION_CLICK_STEP = 6
+RUMAH123_VERIFICATION_CLICK_MAX = 30  # max clicks per wave inside the zone
+
+# Page text that indicates the "verify you are human" challenge.
+RUMAH123_VERIFICATION_PHRASES = (
+    "melakukan verifikasi keamanan",
+    "verifikasi bahwa anda adalah manusia",
+    "buktikan bahwa anda adalah manusia",
+)
+
+
+def _rumah123_page_has_verification(html_lower: str) -> bool:
+    """True if the page shows the human verification challenge (checkbox must be clicked in browser)."""
+    return any(phrase in html_lower for phrase in RUMAH123_VERIFICATION_PHRASES)
+
+
 RUMAH123_BASE = "https://www.rumah123.com"
 RUMAH123_LISTING = f"{RUMAH123_BASE}/sewa/bali/villa/"
 
@@ -312,6 +337,21 @@ def _rumah123_session():
     s = requests.Session()
     # Do not set fixed User-Agent here; use _rumah123_headers() on every request
     return s
+
+
+def _rumah123_extract_max_pages_from_html(html: str) -> int | None:
+    """
+    Inspect listing HTML and infer the maximum page number from pagination links.
+    We look for links like '?page=2', '?page=10', etc. and take the highest value.
+    Returns None if no pagination links are found.
+    """
+    if not html:
+        return None
+    try:
+        nums = [int(m) for m in re.findall(r"[?&]page=(\d+)", html)]
+        return max(nums) if nums else None
+    except Exception:
+        return None
 
 
 def _find_text_in_body(soup: BeautifulSoup, pattern):
@@ -552,11 +592,82 @@ def _rumah123_browser(headless: bool = False):
     return page, browser, pw
 
 
-def _rumah123_cloudflare_click_if_present(page, timeout_ms: int = 6000) -> bool:
-    """If a Cloudflare challenge / Rumah123 security page is visible, try to click the checkbox. Returns True if clicked."""
+def _rumah123_show_click_zone_overlay(page) -> None:
+    """Inject a visible overlay on the page showing the click zone and each click point (visible to human eye)."""
+    x_min = RUMAH123_VERIFICATION_CLICK_X_MIN
+    x_max = RUMAH123_VERIFICATION_CLICK_X_MAX
+    y_min = RUMAH123_VERIFICATION_CLICK_Y_MIN
+    y_max = RUMAH123_VERIFICATION_CLICK_Y_MAX
+    step = RUMAH123_VERIFICATION_CLICK_STEP
+    try:
+        page.evaluate(
+            """
+            ([xMin, xMax, yMin, yMax, step]) => {
+                const id = 'rumah123-click-zone-overlay';
+                if (document.getElementById(id)) return;
+                const wrap = document.createElement('div');
+                wrap.id = id;
+                wrap.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;';
+                const box = document.createElement('div');
+                box.style.cssText = 'position:absolute;left:' + xMin + 'px;top:' + yMin + 'px;width:' + (xMax - xMin) + 'px;height:' + (yMax - yMin) + 'px;border:3px solid rgba(255,80,0,0.95);background:rgba(255,180,0,0.25);box-sizing:border-box;';
+                wrap.appendChild(box);
+                for (let y = yMin; y <= yMax; y += step) {
+                    for (let x = xMin; x <= xMax; x += step) {
+                        const dot = document.createElement('div');
+                        dot.style.cssText = 'position:absolute;left:' + (x - 2) + 'px;top:' + (y - 2) + 'px;width:4px;height:4px;border-radius:2px;background:rgba(255,0,0,0.8);';
+                        wrap.appendChild(dot);
+                    }
+                }
+                document.body.appendChild(wrap);
+                setTimeout(() => { const e = document.getElementById(id); if (e) e.remove(); }, 8000);
+            }
+            """,
+            [x_min, x_max, y_min, y_max, step],
+        )
+    except Exception as e:
+        log.debug("rumah123 | show click zone overlay failed: %s", e)
+
+
+def _rumah123_click_verification_by_position(page) -> bool:
+    """Simulate a wave of clicks across the verification widget area to hit the checkbox. Returns True if any click was sent. Max clicks per wave = RUMAH123_VERIFICATION_CLICK_MAX."""
+    try:
+        step = RUMAH123_VERIFICATION_CLICK_STEP
+        x_min, x_max = RUMAH123_VERIFICATION_CLICK_X_MIN, RUMAH123_VERIFICATION_CLICK_X_MAX
+        y_min, y_max = RUMAH123_VERIFICATION_CLICK_Y_MIN, RUMAH123_VERIFICATION_CLICK_Y_MAX
+        max_clicks = RUMAH123_VERIFICATION_CLICK_MAX
+        _rumah123_show_click_zone_overlay(page)
+        time.sleep(0.5)
+        count = 0
+        for y in range(y_min, y_max + 1, step):
+            for x in range(x_min, x_max + 1, step):
+                if count >= max_clicks:
+                    break
+                try:
+                    page.mouse.click(x, y)
+                    count += 1
+                    time.sleep(0.03)
+                except Exception:
+                    pass
+            if count >= max_clicks:
+                break
+        if count:
+            log.info("rumah123 | verification area: sent %s clicks across widget region", count)
+            time.sleep(2)
+            return True
+    except Exception as e:
+        log.debug("rumah123 | verification wave click failed: %s", e)
+    return False
+
+
+def _rumah123_cloudflare_click_if_present(page, headless: bool = True, timeout_ms: int = 6000) -> bool:
+    """If a Cloudflare challenge / Rumah123 security page is visible, try to click the checkbox. Returns True if clicked.
+    Position-based clicks are only sent when we're on a verification page (content check) and in visible (non-headless) mode."""
     try:
         time.sleep(1.5)
-        # Advanced Playwright-based handling:
+        # 0) Wave of clicks ONLY on verification page and only in visible browser
+        if not headless and _rumah123_page_has_verification(page.content().lower()):
+            _rumah123_click_verification_by_position(page)
+        # 1) Try frame/label-based click (if checkbox is in an iframe we can access)
         # 1) Look through all frames for the Cloudflare / Rumah123 challenge.
         for frame in page.frames:
             url = (frame.url or "").lower()
@@ -619,41 +730,44 @@ def _rumah123_cloudflare_click_if_present(page, timeout_ms: int = 6000) -> bool:
     return False
 
 
-def _rumah123_fetch_listing_playwright(page, page_num: int, listing_sleep: float) -> tuple[list[str], bool]:
-    """Fetch one listing page via Playwright. Returns (links, ok). Handles Cloudflare/security verification and waits until it is passed."""
-    url = RUMAH123_LISTING if page_num <= 1 else f"{RUMAH123_LISTING}?page={page_num}"
-    for attempt in range(3):
+def _rumah123_fetch_listing_in_visible_browser(page_num: int, close_before: tuple | None = None) -> tuple[list[str], bool]:
+    """Open a temporary non-headless browser, load the listing page, apply clicks if verification appears, collect links, then close browser.
+    If close_before is (browser, pw), close them first so only one Chromium runs. Returns (links, ok)."""
+    if close_before is not None:
         try:
-            page.set_extra_http_headers(_rumah123_headers())
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            # Try to auto-click Cloudflare / security verification if present,
-            # and wait until either the challenge is gone or we hit a timeout.
-            start = time.time()
-            while True:
-                _rumah123_cloudflare_click_if_present(page)
-                html_lower = page.content().lower()
-                if "melakukan verifikasi keamanan" not in html_lower:
-                    break
-                if time.time() - start > 120:
-                    log.warning("rumah123 | security verification still present after 120s on listing page %s", page_num)
-                    break
-                log.info("rumah123 | waiting for security verification to be solved on listing page %s...", page_num)
-                time.sleep(5)
-
-            if page_num == 1:
-                log.info("rumah123 | waiting for property links after any security verification...")
-            page.wait_for_selector("a[href*='/properti/']", timeout=120_000)
-            time.sleep(2)
-            html = page.content()
-            break
+            browser, pw = close_before
+            browser.close()
+            pw.stop()
+            log.info("rumah123 | closed headless browser before opening visible one")
         except Exception as e:
-            if attempt < 2:
-                time.sleep(5 * (attempt + 1))
-            else:
-                log.warning("rumah123 | page %s failed after retries: %s", page_num, e)
-                return ([], False)
-    else:
+            log.debug("rumah123 | closing headless before visible: %s", e)
+    url = RUMAH123_LISTING if page_num <= 1 else f"{RUMAH123_LISTING}?page={page_num}"
+    log.warning("rumah123 | verification required: opening temporary VISIBLE browser for listing page %s", page_num)
+    handle = _rumah123_browser(headless=False)
+    if not handle:
+        log.error("rumah123 | failed to launch visible browser (playwright/chromium may be missing); cannot complete verification")
         return ([], False)
+    log.info("rumah123 | visible browser launched; loading page and applying clicks in widget area")
+    page, browser, pw = handle
+    try:
+        page.set_extra_http_headers(_rumah123_headers())
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        time.sleep(2)
+        log.info("rumah123 | waiting 6s for verification checkbox to appear")
+        time.sleep(6)
+        start = time.time()
+        while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 15:
+            _rumah123_cloudflare_click_if_present(page, headless=False)
+            time.sleep(3)
+        try:
+            page.wait_for_selector("a[href*='/properti/']", timeout=60_000)
+        except Exception:
+            pass
+        time.sleep(2)
+        html = page.content()
+    finally:
+        browser.close()
+        pw.stop()
     soup = BeautifulSoup(html, "html.parser")
     links = []
     for a in soup.find_all("a", href=True):
@@ -665,43 +779,174 @@ def _rumah123_fetch_listing_playwright(page, page_num: int, listing_sleep: float
             full = urljoin(RUMAH123_BASE, path)
             if full not in links:
                 links.append(full)
-    return (links, True)
+    log.info("rumah123 | visible browser closed; resuming headless (collected %s links from page %s)", len(links), page_num)
+    return (links, bool(links))
 
 
-def _rumah123_fetch_detail_playwright(page, url: str, delay: float) -> dict | None:
-    """Fetch one detail page via Playwright and return parsed row. Handles Cloudflare/security verification and waits until it is passed."""
-    time.sleep(delay)
+def _rumah123_fetch_detail_in_visible_browser(url: str, close_before: tuple | None = None) -> tuple[dict | None, bool]:
+    """Open a temporary non-headless browser, load the detail URL, apply clicks if verification appears, parse row, then close browser.
+    If close_before is (browser, pw), close them first so only one Chromium runs (avoids visible window not opening on macOS). Returns (row, ok)."""
+    if close_before is not None:
+        try:
+            browser, pw = close_before
+            browser.close()
+            pw.stop()
+            log.info("rumah123 | closed headless browser before opening visible one")
+        except Exception as e:
+            log.debug("rumah123 | closing headless before visible: %s", e)
+    log.warning("rumah123 | verification required: opening temporary VISIBLE browser for detail page")
+    handle = _rumah123_browser(headless=False)
+    if not handle:
+        log.error("rumah123 | failed to launch visible browser (playwright/chromium may be missing); cannot complete verification")
+        return (None, False)
+    log.info("rumah123 | visible browser launched; loading page and applying clicks in widget area")
+    page, browser, pw = handle
+    try:
+        page.set_extra_http_headers(_rumah123_headers())
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        time.sleep(2)
+        log.info("rumah123 | waiting 6s for verification checkbox to appear")
+        time.sleep(6)
+        start = time.time()
+        while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 15:
+            _rumah123_cloudflare_click_if_present(page, headless=False)
+            time.sleep(3)
+        try:
+            page.wait_for_selector("h1", timeout=60_000)
+        except Exception:
+            pass
+        time.sleep(1)
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+        row = _rumah123_soup_to_row(soup, url)
+    finally:
+        browser.close()
+        pw.stop()
+    log.info("rumah123 | visible browser closed; resuming headless")
+    return (row, row is not None)
+
+
+def _rumah123_fetch_listing_playwright(
+    page, page_num: int, listing_sleep: float, headless: bool = True, browser_handle: tuple | None = None
+) -> tuple[list[str], bool, bool, bool]:
+    """Fetch one listing page via Playwright. Returns (links, ok, security_blocked, browser_closed)."""
+    url = RUMAH123_LISTING if page_num <= 1 else f"{RUMAH123_LISTING}?page={page_num}"
+    security_blocked = False
+    close_before = (browser_handle[1], browser_handle[2]) if browser_handle else None
+    security_wait_sec = RUMAH123_SECURITY_RETRY_SEC if headless else 120
     for attempt in range(3):
         try:
             page.set_extra_http_headers(_rumah123_headers())
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            # Wait for security verification (if any) to be automatically solved
+            time.sleep(1)  # shorter wait: let verification challenge/render settle
+            html_lower = page.content().lower()
+            if headless and _rumah123_page_has_verification(html_lower):
+                log.info("rumah123 | verification detected on listing page %s (initial check); opening visible browser", page_num)
+                links, ok = _rumah123_fetch_listing_in_visible_browser(page_num, close_before=close_before)
+                return (links, ok, False, close_before is not None)
             start = time.time()
             while True:
-                _rumah123_cloudflare_click_if_present(page)
+                _rumah123_cloudflare_click_if_present(page, headless=headless)
                 html_lower = page.content().lower()
-                if "melakukan verifikasi keamanan" not in html_lower:
+                if not _rumah123_page_has_verification(html_lower):
                     break
-                if time.time() - start > 120:
-                    log.warning("rumah123 | security verification still present after 120s on detail page %s", url)
+                if headless:
+                    links, ok = _rumah123_fetch_listing_in_visible_browser(page_num, close_before=close_before)
+                    return (links, ok, False, close_before is not None)
+                if time.time() - start > security_wait_sec:
+                    log.warning("rumah123 | verification still present after %ss on listing page %s; click the checkbox in the browser window", security_wait_sec, page_num)
                     break
-                log.info("rumah123 | waiting for security verification to be solved on detail page %s...", url)
+                log.info("rumah123 | waiting for security verification (click the checkbox in the browser if visible)...")
+                time.sleep(5)
+
+            if page_num == 1:
+                log.info("rumah123 | waiting for property links after any security verification...")
+            try:
+                # Slightly tighter timeout so slow pages don't hold up the whole crawl
+                page.wait_for_selector("a[href*='/properti/']", timeout=8_000)
+            except Exception:
+                if headless:
+                    log.info("rumah123 | listing page %s: no property links found in time; assuming verification, opening visible browser", page_num)
+                    links, ok = _rumah123_fetch_listing_in_visible_browser(page_num, close_before=close_before)
+                    return (links, ok, False, close_before is not None)
+                raise
+            time.sleep(2)
+            html = page.content()
+            break
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+            else:
+                log.warning("rumah123 | page %s failed after retries: %s", page_num, e)
+                return ([], False, False, False)
+    else:
+        return ([], False, False, False)
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href.startswith("/properti/") or "/agent-" in href or "/independent-property-agent/" in href:
+            continue
+        if re.search(r"-(?:hor|vlr)\d+/?$", href):
+            path = href.rstrip("/") + "/" if not href.endswith("/") else href
+            full = urljoin(RUMAH123_BASE, path)
+            if full not in links:
+                links.append(full)
+    return (links, True, False, False)
+
+
+def _rumah123_fetch_detail_playwright(
+    page, url: str, delay: float, headless: bool = True, browser_handle: tuple | None = None
+) -> tuple[dict | None, bool, bool]:
+    """Fetch one detail page via Playwright. Returns (parsed_row_or_none, security_blocked, browser_closed).
+    When browser_closed is True, caller must re-acquire headless browser (we closed it to open visible)."""
+    time.sleep(delay)
+    security_wait_sec = RUMAH123_SECURITY_RETRY_SEC if headless else 120
+    close_before = (browser_handle[1], browser_handle[2]) if browser_handle else None  # (browser, pw)
+    for attempt in range(3):
+        try:
+            page.set_extra_http_headers(_rumah123_headers())
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            time.sleep(3)  # let verification challenge render (can appear after a delay)
+            html_lower = page.content().lower()
+            # In headless, as soon as we see the challenge: close headless, open visible, collect row, then caller re-acquires headless
+            if headless and _rumah123_page_has_verification(html_lower):
+                log.info("rumah123 | verification detected on detail page (initial check); opening visible browser")
+                row, _ = _rumah123_fetch_detail_in_visible_browser(url, close_before=close_before)
+                return (row, False, close_before is not None)
+            start = time.time()
+            while True:
+                _rumah123_cloudflare_click_if_present(page, headless=headless)
+                html_lower = page.content().lower()
+                if not _rumah123_page_has_verification(html_lower):
+                    break
+                if headless:
+                    row, _ = _rumah123_fetch_detail_in_visible_browser(url, close_before=close_before)
+                    return (row, False, close_before is not None)
+                if time.time() - start > security_wait_sec:
+                    log.warning("rumah123 | verification still present after %ss; click the checkbox in the browser window", security_wait_sec)
+                    break
+                log.info("rumah123 | waiting for security verification (click the checkbox in the browser if visible)...")
                 time.sleep(5)
             try:
-                page.wait_for_selector("h1", timeout=60_000)
+                page.wait_for_selector("h1", timeout=15_000)
             except Exception:
-                pass
+                if headless:
+                    log.info("rumah123 | detail page: no h1 found in time; assuming verification, opening visible browser")
+                    row, _ = _rumah123_fetch_detail_in_visible_browser(url, close_before=close_before)
+                    return (row, False, close_before is not None)
+                raise
             time.sleep(1)
             html = page.content()
             soup = BeautifulSoup(html, "html.parser")
-            return _rumah123_soup_to_row(soup, url)
+            return (_rumah123_soup_to_row(soup, url), False, False)
         except Exception as e:
             if attempt < 2:
                 time.sleep(4 * (attempt + 1))
             else:
                 log.debug("rumah123 | error %s: %s", url[:60], e)
-                return None
-    return None
+                return (None, False, False)
+    return (None, False, False)
 
 
 # ---------------------------------------------------------------------------
@@ -950,26 +1195,60 @@ def run_rumah123(
 ) -> list[dict]:
     log.info("rumah123 | fetching listing pages...")
     seen = existing_urls if existing_urls is not None else set()
-    listing_sleep = 2.5 if getattr(args, "fast", False) else 3.0
+    listing_sleep = 0.5
     base_delay = getattr(args, "delay", 3.0)
     if getattr(args, "fast", False):
         base_delay = max(1.0, base_delay * 0.55)
 
-    # Prefer Playwright so a visible Chromium window opens (same as other sources)
-    browser_handle = _rumah123_browser(headless=getattr(args, "headless", False))
+    # Stage 1: always start headless; when a page shows verification it is re-opened in a one-off visible browser, then we resume headless
+    headless = getattr(args, "headless", True)
+    browser_handle = _rumah123_browser(headless=headless)
     if browser_handle is not None:
         page, browser, pw = browser_handle
         try:
-            log.info("rumah123 | launching browser (visible)")
-            all_links = []
-            for p in range(1, args.pages + 1):
-                log.info("rumah123 | requesting listing page %s", p)
+            log.info("rumah123 | launching browser (headless=%s)", headless)
+            all_links: list[str] = []
+            # Start with the CLI limit; after page 1 we will tighten this based on detected pagination.
+            max_listing_pages = max(1, args.pages)
+            p = 1
+            detected_total_pages: int | None = None
+            while p <= max_listing_pages:
+                if detected_total_pages:
+                    log.info("rumah123 | requesting listing page %s/%s", p, detected_total_pages)
+                else:
+                    log.info("rumah123 | requesting listing page %s (total unknown yet)", p)
                 if p > 1:
                     time.sleep(listing_sleep)
-                links, ok = _rumah123_fetch_listing_playwright(page, p, listing_sleep)
+                links, ok, _, browser_closed = _rumah123_fetch_listing_playwright(
+                    page, p, listing_sleep, headless=headless, browser_handle=(page, browser, pw)
+                )
+                if browser_closed:
+                    browser_handle = _rumah123_browser(headless=headless)
+                    if not browser_handle:
+                        log.error("rumah123 | failed to re-launch headless browser after visible fetch")
+                        break
+                    page, browser, pw = browser_handle
+                    log.info("rumah123 | re-launched headless browser")
                 if not ok:
                     time.sleep(8)
+                    p += 1
                     continue
+                # On the first successfully fetched page, infer the total number of listing pages from pagination.
+                if p == 1 and detected_total_pages is None:
+                    try:
+                        html = page.content()
+                        detected = _rumah123_extract_max_pages_from_html(html)
+                    except Exception:
+                        detected = None
+                    if detected and detected > 0:
+                        detected_total_pages = detected
+                        max_listing_pages = min(args.pages, detected_total_pages)
+                        log.info(
+                            "rumah123 | pagination: detected %s total listing pages; will fetch up to %s (CLI limit %s)",
+                            detected_total_pages,
+                            max_listing_pages,
+                            args.pages,
+                        )
                 if not links:
                     break
                 before = len(all_links)
@@ -977,7 +1256,9 @@ def run_rumah123(
                     if link not in all_links:
                         all_links.append(link)
                 if len(all_links) == before:
+                    # No new links from this page; stop paginating.
                     break
+                p += 1
             log.info("rumah123 | collected %s unique property URLs", len(all_links))
             if not all_links:
                 log.warning("rumah123 | no listing links found")
@@ -992,21 +1273,37 @@ def run_rumah123(
                 log.info("rumah123 | no new URLs to fetch")
                 return []
             delay = base_delay
-            log.info("rumah123 | fetching %s detail pages (delay ~%ss)", len(links_to_fetch), round(delay, 1))
-            rows = []
+            log.info(
+                "rumah123 | fetching %s detail pages sequentially (delay ~%ss per URL)",
+                len(links_to_fetch),
+                round(delay, 1),
+            )
+            rows: list[dict] = []
             total = len(links_to_fetch)
             for done, url in enumerate(links_to_fetch, 1):
                 if done % 50 == 0 or done == total:
                     log.info("rumah123 | detail progress %s/%s", done, total)
-                row = _rumah123_fetch_detail_playwright(page, url, delay)
+                row, _, browser_closed = _rumah123_fetch_detail_playwright(
+                    page, url, delay, headless=headless, browser_handle=(page, browser, pw)
+                )
+                if browser_closed:
+                    browser_handle = _rumah123_browser(headless=headless)
+                    if not browser_handle:
+                        log.error("rumah123 | failed to re-launch headless browser after visible fetch")
+                        break
+                    page, browser, pw = browser_handle
+                    log.info("rumah123 | re-launched headless browser")
                 if row and _row_has_title_and_price(row, "rumah123"):
                     flat = flatten_row(row, source="rumah123")
                     if _write_row_to_csv(csv_handle, flat, seen):
                         rows.append(flat)
             return rows
         finally:
-            browser.close()
-            pw.stop()
+            try:
+                browser.close()
+                pw.stop()
+            except Exception:
+                pass
 
     # Fallback: requests (no browser, e.g. Playwright not installed)
     session = _rumah123_session()
@@ -1046,33 +1343,26 @@ def run_rumah123(
     if not links_to_fetch:
         log.info("rumah123 | no new URLs to fetch")
         return []
-    workers = max(1, min(args.workers, 32))
-    delay = max(0.5, base_delay / workers) if workers > 1 else base_delay
-    log.info("rumah123 | fetching %s detail pages with %s workers (delay ~%ss)", len(links_to_fetch), workers, round(delay, 1))
-
-    def fetch_one(url: str):
-        try:
-            s = _rumah123_session()
-            out = rumah123_parse_detail(s, url, delay=delay)
-            if out and _row_has_title_and_price(out, "rumah123"):
-                log.debug("rumah123 | ok %s", url)
-            elif out:
-                log.debug("rumah123 | skip (no title/price) %s", url)
-            return out
-        except Exception as e:
-            log.warning("rumah123 | error %s: %s", url, e)
-            return None
+    delay = base_delay
+    log.info("rumah123 | fetching %s detail pages sequentially (delay ~%ss)", len(links_to_fetch), round(delay, 1))
 
     rows = []
     total = len(links_to_fetch)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for done, row in enumerate(executor.map(fetch_one, links_to_fetch), 1):
-            if done % 50 == 0 or done == total:
-                log.info("rumah123 | detail progress %s/%s", done, total)
+    for done, url in enumerate(links_to_fetch, 1):
+        if done % 50 == 0 or done == total:
+            log.info("rumah123 | detail progress %s/%s", done, total)
+        try:
+            s = _rumah123_session()
+            row = rumah123_parse_detail(s, url, delay=delay)
             if row and _row_has_title_and_price(row, "rumah123"):
+                log.debug("rumah123 | ok %s", url)
                 flat = flatten_row(row, source="rumah123")
                 if _write_row_to_csv(csv_handle, flat, seen):
                     rows.append(flat)
+            elif row:
+                log.debug("rumah123 | skip (no title/price) %s", url)
+        except Exception as e:
+            log.warning("rumah123 | error %s: %s", url, e)
     return rows
 
 
@@ -1133,19 +1423,18 @@ def main():
     ap.add_argument("--append", action="store_true", help="Append to existing CSV")
     ap.add_argument("--list-only", action="store_true", help="Only collect URLs to .txt (single source only)")
     ap.add_argument("--json", action="store_true", help="Also write JSON (Rumah123 only)")
-    ap.add_argument("--workers", "-w", type=int, default=1, help="Workers per source for detail fetch (default 1)")
-    ap.add_argument("--headless", action="store_true", help="Run browser headless (Playwright sources)")
+    ap.add_argument("--workers", "-w", type=int, default=1, help="Ignored; detail fetch runs sequentially (kept for CLI compatibility)")
+    ap.add_argument("--no-headless", action="store_true", help="Run browser visible (default is headless); use if security verification needs to be completed manually")
     ap.add_argument("--fast", "-f", action="store_true", help="Shorter delays for all sources (faster, minimal block risk)")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level (default: INFO)")
     ap.add_argument("--log-file", metavar="PATH", default=None, help="Also write logs to this file (utf-8)")
     ap.add_argument("--resume", action="store_true", default=True, help="Load existing URLs from output file and skip duplicates (default: on)")
     ap.add_argument("--no-resume", action="store_false", dest="resume", help="Disable resume; do not load existing URLs (fetch and write all)")
     args = ap.parse_args()
-    args.headless = False  # always use visible browser (non-headless) for all sources
+    args.headless = not getattr(args, "no_headless", False)  # default: headless True
 
     setup_logging(level=args.log_level, log_file=args.log_file)
-    log.info("source=%s output=%s append=%s", args.source, args.output, args.append)
-    log.info("Browser sources (rumah123, balilongterm, balicoconut, balihomeimmo) will run in visible window (non-headless)")
+    log.info("source=%s output=%s append=%s headless=%s", args.source, args.output, args.append, args.headless)
 
     # "all" = Rumah123, BLT, BCL, Bali Home Immo (yearly+monthly)
     sources_to_run = ["rumah123", "balilongterm", "balicoconut", "balihomeimmo"] if args.source == "all" else [args.source]
@@ -1157,7 +1446,9 @@ def main():
     all_rows = []
     out_path = Path(args.output)
     file_exists = out_path.exists()
-    write_header = not args.append or not file_exists
+    # With resume (default), never truncate: append if file exists so previous session data is kept
+    use_append = args.append or (getattr(args, "resume", True) and file_exists)
+    write_header = not (use_append and file_exists)
 
     # Resume & duplicate detection (default: on). Load existing URLs from CSV/Excel so we skip them.
     if getattr(args, "resume", True):
@@ -1214,7 +1505,7 @@ def main():
                         new_rows.append(r)
                         existing_urls.add(url)
                 if new_rows:
-                    mode = "w" if write_header else "a"
+                    mode = "a" if use_append else "w"
                     with open(out_path, mode, newline="", encoding="utf-8") as f:
                         w = csv.DictWriter(f, fieldnames=MAIN_CSV_COLUMNS, extrasaction="ignore")
                         if write_header:
@@ -1230,8 +1521,8 @@ def main():
             else:
                 log.warning("%s returned no data", src)
     else:
-        # Single source: open CSV once, write header, then write each row as it is retrieved
-        with open(out_path, "a" if args.append else "w", newline="", encoding="utf-8") as f:
+        # Single source: open CSV once (append when resuming so we never erase previous data)
+        with open(out_path, "a" if use_append else "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=MAIN_CSV_COLUMNS, extrasaction="ignore")
             if write_header:
                 w.writeheader()
