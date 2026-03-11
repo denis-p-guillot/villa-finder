@@ -137,6 +137,66 @@ DURATION_MAP = {
     "/year": "year", "/month": "month", "/day": "day",
 }
 
+RUMAH123_BALI_LOCATIONS = [
+    "Abang",
+    "Abiansemal",
+    "Banjar",
+    "Banjarangkan",
+    "Bangli",
+    "Baturiti",
+    "Bebandem",
+    "Blahbatuh",
+    "Buleleng",
+    "Busungbiu",
+    "Dawan",
+    "Denpasar Barat",
+    "Denpasar Selatan",
+    "Denpasar Timur",
+    "Denpasar Utara",
+    "Gerokgak",
+    "Gianyar",
+    "Jembrana",
+    "Karangasem",
+    "Kediri",
+    "Kerambitan",
+    "Kintamani",
+    "Klungkung",
+    "Kubu",
+    "Kubutambahan",
+    "Kuta",
+    "Kuta Selatan",
+    "Kuta Utara",
+    "Manggis",
+    "Marga",
+    "Melaya",
+    "Mendoyo",
+    "Mengwi",
+    "Negara",
+    "Nusa Penida",
+    "Payangan",
+    "Pekutatan",
+    "Penebel",
+    "Petang",
+    "Pupuan",
+    "Rendang",
+    "Sawan",
+    "Selemadeg",
+    "Selemadeg Barat",
+    "Selemadeg Timur",
+    "Selat",
+    "Seririt",
+    "Sidemen",
+    "Sukawati",
+    "Sukasada",
+    "Susut",
+    "Tabanan",
+    "Tampaksiring",
+    "Tegallalang",
+    "Tejakula",
+    "Tembuku",
+    "Ubud",
+]
+
 
 def _parse_price_idr_rumah123(price_text: str) -> tuple[str, str]:
     price_text = (price_text or "").strip()
@@ -463,6 +523,23 @@ def _rumah123_normalize_image_url(url: str) -> str:
     return url
 
 
+def _rumah123_normalize_location(raw_location: str) -> str:
+    """
+    Given a free-text location like 'Jimbaran, Badung' or 'Villa in Ubud Bali',
+    normalize it to one of the known Bali districts if possible.
+    Returns the matched canonical name, or the original string if no match.
+    """
+    loc = (raw_location or "").strip()
+    if not loc:
+        return ""
+    lower = loc.lower()
+    # Prefer longer names first (e.g. 'Kuta Selatan' before 'Kuta').
+    for name in sorted(RUMAH123_BALI_LOCATIONS, key=len, reverse=True):
+        if name.lower() in lower:
+            return name
+    return loc
+
+
 def _rumah123_extract_images_from_html(html: str, max_images: int = 40) -> list[str]:
     """
     Extract a list of image URLs from raw Rumah123 detail HTML.
@@ -674,6 +751,10 @@ def _rumah123_soup_to_row(soup: BeautifulSoup, url: str, html: str | None = None
         if el.parent and getattr(el.parent, "name", None) in ("script", "style", "noscript"):
             continue
         t = el.strip()
+        # Skip anything that looks like a URL (e.g. "https://www.rumah123.com/...")
+        tl = t.lower()
+        if tl.startswith("http://") or tl.startswith("https://") or "://" in tl:
+            continue
         if 5 <= len(t) <= 120:
             location = t
             break
@@ -693,6 +774,9 @@ def _rumah123_soup_to_row(soup: BeautifulSoup, url: str, html: str | None = None
                 if len(t) > 50 and "Deskripsi" not in t and "push(" not in t:
                     desc = t[:5000]
                     break
+    # Normalize location to a canonical Bali district name when possible.
+    location = _rumah123_normalize_location(location)
+
     updated_by = ""
     agent_name = ""
     for el in soup.find_all(string=re.compile(r"Diperbarui.*oleh", re.I)):
