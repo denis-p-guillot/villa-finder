@@ -41,11 +41,12 @@ except ImportError:
 
 
 def _csv_cell(s: str) -> str:
+    """Sanitize a value for CSV: no commas, no newlines, no double-quotes."""
     if not isinstance(s, str):
         return ""
     if "push(" in s or '"formats"' in s or '"locale"' in s:
         return ""
-    s = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    s = str(s).replace('"', "'").replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
     s = re.sub(r" +", " ", s).strip()
     if len(s) > 8000:
         s = s[:8000] + "..."
@@ -271,20 +272,45 @@ def _row_to_portal_villa(row: dict, source: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# User-Agent rotation (new UA for every request)
+# ---------------------------------------------------------------------------
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+]
+
+
+def _random_user_agent() -> str:
+    return random.choice(USER_AGENTS)
+
+
+def _rumah123_headers() -> dict:
+    return {
+        "User-Agent": _random_user_agent(),
+        "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Rumah123
 # ---------------------------------------------------------------------------
 
 RUMAH123_BASE = "https://www.rumah123.com"
 RUMAH123_LISTING = f"{RUMAH123_BASE}/sewa/bali/villa/"
-RUMAH123_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
-}
 
 
 def _rumah123_session():
     s = requests.Session()
-    s.headers.update(RUMAH123_HEADERS)
+    # Do not set fixed User-Agent here; use _rumah123_headers() on every request
     return s
 
 
@@ -309,7 +335,7 @@ def rumah123_fetch_listing_links(session: requests.Session, page: int = 1) -> tu
     r = None
     for attempt in range(4):
         try:
-            r = session.get(url, timeout=45)
+            r = session.get(url, timeout=45, headers=_rumah123_headers())
             # Retry up to 3 times with backoff when rate-limited
             for retry in range(3):
                 if r.status_code != 429:
@@ -318,7 +344,7 @@ def rumah123_fetch_listing_links(session: requests.Session, page: int = 1) -> tu
                 wait = 20 + (retry * 15)  # 20s, then 35s, then 50s
                 log.info("rumah123 | 429 rate limit, waiting %ss before retry %s", wait, retry + 1)
                 time.sleep(wait)
-                r = session.get(url, timeout=45)
+                r = session.get(url, timeout=45, headers=_rumah123_headers())
             r.raise_for_status()
             break
         except Exception as e:
@@ -487,12 +513,12 @@ def rumah123_parse_detail(session: requests.Session, url: str, delay: float = 1.
     time.sleep(delay)
     for attempt in range(3):
         try:
-            r = session.get(url, timeout=45)
+            r = session.get(url, timeout=45, headers=_rumah123_headers())
             for _ in range(2):
                 if r.status_code != 429:
                     break
                 time.sleep(20)
-                r = session.get(url, timeout=45)
+                r = session.get(url, timeout=45, headers=_rumah123_headers())
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
             return _rumah123_soup_to_row(soup, url)
@@ -517,7 +543,7 @@ def _rumah123_browser(headless: bool = False):
         args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
     )
     context = browser.new_context(
-        user_agent=RUMAH123_HEADERS.get("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
+        user_agent=_random_user_agent(),
         locale="id-ID",
         viewport={"width": 1920, "height": 1080},
     )
@@ -598,6 +624,7 @@ def _rumah123_fetch_listing_playwright(page, page_num: int, listing_sleep: float
     url = RUMAH123_LISTING if page_num <= 1 else f"{RUMAH123_LISTING}?page={page_num}"
     for attempt in range(3):
         try:
+            page.set_extra_http_headers(_rumah123_headers())
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
             # Try to auto-click Cloudflare / security verification if present,
             # and wait until either the challenge is gone or we hit a timeout.
@@ -646,6 +673,7 @@ def _rumah123_fetch_detail_playwright(page, url: str, delay: float) -> dict | No
     time.sleep(delay)
     for attempt in range(3):
         try:
+            page.set_extra_http_headers(_rumah123_headers())
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
             # Wait for security verification (if any) to be automatically solved
             start = time.time()
@@ -704,6 +732,13 @@ def villa_bali_parse_price(price_text: str) -> tuple[str, str]:
         return "", "day"
 
 
+def _villa_bali_headers() -> dict:
+    return {
+        "User-Agent": _random_user_agent(),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
 def villa_bali_get_browser(headless: bool = False):
     try:
         from playwright.sync_api import sync_playwright
@@ -712,7 +747,7 @@ def villa_bali_get_browser(headless: bool = False):
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
     context = browser.new_context(
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        user_agent=_random_user_agent(),
         locale="en-US",
         viewport={"width": 1920, "height": 1080},
     )
@@ -723,6 +758,7 @@ def villa_bali_get_browser(headless: bool = False):
 
 def villa_bali_fetch_listing_links(page) -> list[str]:
     _human_delay(2, 2)
+    page.set_extra_http_headers(_villa_bali_headers())
     page.goto(VILLA_BALI_SEARCH, wait_until="load", timeout=45000)
     _human_delay(5, 4)
     for _ in range(5):
@@ -750,6 +786,7 @@ def villa_bali_parse_detail(page, url: str, delay: float = 1.0) -> dict | None:
     _human_delay(delay, 4)
     for attempt in range(2):
         try:
+            page.set_extra_http_headers(_villa_bali_headers())
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception:
             if attempt == 0:
@@ -829,11 +866,90 @@ def villa_bali_parse_detail(page, url: str, delay: float = 1.0) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Resume & duplicate detection (load existing URLs from CSV/Excel)
 # ---------------------------------------------------------------------------
 
-def run_rumah123(args) -> list[dict]:
+def _load_existing_urls(path: Path) -> set[str]:
+    """
+    Load all existing listing URLs from the output file (CSV or Excel) for resume and duplicate detection.
+    Returns a set of URL strings (strip, non-empty). Returns empty set if file missing or unreadable.
+    """
+    if not path.exists():
+        return set()
+    urls = set()
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".csv":
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames and "url" in reader.fieldnames:
+                    for row in reader:
+                        u = (row.get("url") or "").strip()
+                        if u:
+                            urls.add(u)
+        elif suffix in (".xlsx", ".xls"):
+            try:
+                import openpyxl
+            except ImportError:
+                log.debug("openpyxl not installed; cannot read Excel for existing URLs")
+                return set()
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            sheet = wb.active
+            if sheet is None:
+                wb.close()
+                return set()
+            header = None
+            url_col = None
+            for row in sheet.iter_rows(min_row=1, max_row=1, values_only=True):
+                header = row
+                break
+            if header:
+                for i, h in enumerate(header):
+                    if (h or "").strip().lower() == "url":
+                        url_col = i
+                        break
+            if url_col is not None:
+                for row in sheet.iter_rows(min_row=2, values_only=True):
+                    if len(row) > url_col:
+                        u = (row[url_col] or "").strip()
+                        if isinstance(u, str) and u:
+                            urls.add(u)
+            wb.close()
+    except Exception as e:
+        log.warning("Could not load existing URLs from %s: %s", path, e)
+    return urls
+
+
+def _write_row_to_csv(
+    csv_handle: tuple | None,
+    row: dict,
+    existing_urls: set[str] | None = None,
+) -> bool:
+    """
+    If csv_handle is (writer, file), write one row and flush.
+    If existing_urls is set and row["url"] is already in it, skip write and return False.
+    Otherwise write, add row["url"] to existing_urls, and return True.
+    """
+    if csv_handle is None:
+        return True
+    url = (row.get("url") or "").strip()
+    if existing_urls is not None and url in existing_urls:
+        return False
+    writer, f = csv_handle
+    writer.writerow(row)
+    f.flush()
+    if existing_urls is not None and url:
+        existing_urls.add(url)
+    return True
+
+
+def run_rumah123(
+    args,
+    csv_handle: tuple | None = None,
+    existing_urls: set[str] | None = None,
+) -> list[dict]:
     log.info("rumah123 | fetching listing pages...")
+    seen = existing_urls if existing_urls is not None else set()
     listing_sleep = 2.5 if getattr(args, "fast", False) else 3.0
     base_delay = getattr(args, "delay", 3.0)
     if getattr(args, "fast", False):
@@ -868,16 +984,25 @@ def run_rumah123(args) -> list[dict]:
                 return []
             if args.list_only:
                 return all_links
+            links_to_fetch = [u for u in all_links if u not in seen]
+            skipped = len(all_links) - len(links_to_fetch)
+            if skipped:
+                log.info("rumah123 | skipping %s URLs already in output (resume/duplicate detection)", skipped)
+            if not links_to_fetch:
+                log.info("rumah123 | no new URLs to fetch")
+                return []
             delay = base_delay
-            log.info("rumah123 | fetching %s detail pages (delay ~%ss)", len(all_links), round(delay, 1))
+            log.info("rumah123 | fetching %s detail pages (delay ~%ss)", len(links_to_fetch), round(delay, 1))
             rows = []
-            total = len(all_links)
-            for done, url in enumerate(all_links, 1):
+            total = len(links_to_fetch)
+            for done, url in enumerate(links_to_fetch, 1):
                 if done % 50 == 0 or done == total:
                     log.info("rumah123 | detail progress %s/%s", done, total)
                 row = _rumah123_fetch_detail_playwright(page, url, delay)
                 if row and _row_has_title_and_price(row, "rumah123"):
-                    rows.append(flatten_row(row, source="rumah123"))
+                    flat = flatten_row(row, source="rumah123")
+                    if _write_row_to_csv(csv_handle, flat, seen):
+                        rows.append(flat)
             return rows
         finally:
             browser.close()
@@ -914,9 +1039,16 @@ def run_rumah123(args) -> list[dict]:
         return []
     if args.list_only:
         return all_links
+    links_to_fetch = [u for u in all_links if u not in seen]
+    skipped = len(all_links) - len(links_to_fetch)
+    if skipped:
+        log.info("rumah123 | skipping %s URLs already in output (resume/duplicate detection)", skipped)
+    if not links_to_fetch:
+        log.info("rumah123 | no new URLs to fetch")
+        return []
     workers = max(1, min(args.workers, 32))
     delay = max(0.5, base_delay / workers) if workers > 1 else base_delay
-    log.info("rumah123 | fetching %s detail pages with %s workers (delay ~%ss)", len(all_links), workers, round(delay, 1))
+    log.info("rumah123 | fetching %s detail pages with %s workers (delay ~%ss)", len(links_to_fetch), workers, round(delay, 1))
 
     def fetch_one(url: str):
         try:
@@ -932,18 +1064,25 @@ def run_rumah123(args) -> list[dict]:
             return None
 
     rows = []
-    total = len(all_links)
+    total = len(links_to_fetch)
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        for done, row in enumerate(executor.map(fetch_one, all_links), 1):
+        for done, row in enumerate(executor.map(fetch_one, links_to_fetch), 1):
             if done % 50 == 0 or done == total:
                 log.info("rumah123 | detail progress %s/%s", done, total)
             if row and _row_has_title_and_price(row, "rumah123"):
-                rows.append(flatten_row(row, source="rumah123"))
+                flat = flatten_row(row, source="rumah123")
+                if _write_row_to_csv(csv_handle, flat, seen):
+                    rows.append(flat)
     return rows
 
 
-def run_villa_bali(args) -> list[dict] | list[str] | None:
+def run_villa_bali(
+    args,
+    csv_handle: tuple | None = None,
+    existing_urls: set[str] | None = None,
+) -> list[dict] | list[str] | None:
     log.info("villa-bali | launching browser (may hit Cloudflare)")
+    seen = existing_urls if existing_urls is not None else set()
     page, browser, pw = villa_bali_get_browser(headless=args.headless)
     try:
         links = villa_bali_fetch_listing_links(page)
@@ -953,16 +1092,25 @@ def run_villa_bali(args) -> list[dict] | list[str] | None:
             return []
         if args.list_only:
             return links  # caller writes .txt
-        log.info("villa-bali | fetching %s detail pages (delay %ss)", len(links), args.delay)
+        links_to_fetch = [u for u in links if u not in seen]
+        skipped = len(links) - len(links_to_fetch)
+        if skipped:
+            log.info("villa-bali | skipping %s URLs already in output (resume/duplicate detection)", skipped)
+        if not links_to_fetch:
+            log.info("villa-bali | no new URLs to fetch")
+            return []
+        log.info("villa-bali | fetching %s detail pages (delay %ss)", len(links_to_fetch), args.delay)
         rows = []
-        for i, url in enumerate(links, 1):
-            log.debug("villa-bali | [%s/%s] %s", i, len(links), url)
+        for i, url in enumerate(links_to_fetch, 1):
+            log.debug("villa-bali | [%s/%s] %s", i, len(links_to_fetch), url)
             row = villa_bali_parse_detail(page, url, delay=args.delay)
             if row and _row_has_title_and_price(row, "villa-bali"):
-                rows.append(flatten_row(row, source="villa-bali"))
-                log.debug("villa-bali | ok [%s/%s] %s", i, len(links), url)
+                flat = flatten_row(row, source="villa-bali")
+                if _write_row_to_csv(csv_handle, flat, seen):
+                    rows.append(flat)
+                    log.debug("villa-bali | ok [%s/%s] %s", i, len(links_to_fetch), url)
             else:
-                log.debug("villa-bali | skip (no title/price) [%s/%s] %s", i, len(links), url)
+                log.debug("villa-bali | skip (no title/price) [%s/%s] %s", i, len(links_to_fetch), url)
         return rows
     finally:
         browser.close()
@@ -990,6 +1138,8 @@ def main():
     ap.add_argument("--fast", "-f", action="store_true", help="Shorter delays for all sources (faster, minimal block risk)")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level (default: INFO)")
     ap.add_argument("--log-file", metavar="PATH", default=None, help="Also write logs to this file (utf-8)")
+    ap.add_argument("--resume", action="store_true", default=True, help="Load existing URLs from output file and skip duplicates (default: on)")
+    ap.add_argument("--no-resume", action="store_false", dest="resume", help="Disable resume; do not load existing URLs (fetch and write all)")
     args = ap.parse_args()
     args.headless = False  # always use visible browser (non-headless) for all sources
 
@@ -1009,6 +1159,15 @@ def main():
     file_exists = out_path.exists()
     write_header = not args.append or not file_exists
 
+    # Resume & duplicate detection (default: on). Load existing URLs from CSV/Excel so we skip them.
+    if getattr(args, "resume", True):
+        existing_urls = _load_existing_urls(out_path)
+        if existing_urls:
+            log.info("Resume (default): loaded %s existing URLs from %s; will skip duplicates", len(existing_urls), out_path)
+    else:
+        existing_urls = set()
+        log.info("Resume disabled (--no-resume); will not skip existing URLs")
+
     if args.source == "all":
         # Run sources sequentially to limit resource and bandwidth use
         workers_to_run = [
@@ -1023,9 +1182,9 @@ def main():
             log.info("--- %s ---", src)
             try:
                 if src == "rumah123":
-                    result = run_rumah123(args)
+                    result = run_rumah123(args, existing_urls=existing_urls)
                 elif src == "villa-bali":
-                    result = run_villa_bali(args)
+                    result = run_villa_bali(args, existing_urls=existing_urls)
                 elif src == "balilongterm":
                     result = run_balilongterm(args)
                 elif src == "balicoconut":
@@ -1047,64 +1206,88 @@ def main():
                 return
             rows = result if isinstance(result, list) else []
             if rows:
+                # Skip duplicates: only write rows whose url is not already in existing_urls
+                new_rows = []
+                for r in rows:
+                    url = (r.get("url") or "").strip()
+                    if url and url not in existing_urls:
+                        new_rows.append(r)
+                        existing_urls.add(url)
+                if new_rows:
+                    mode = "w" if write_header else "a"
+                    with open(out_path, mode, newline="", encoding="utf-8") as f:
+                        w = csv.DictWriter(f, fieldnames=MAIN_CSV_COLUMNS, extrasaction="ignore")
+                        if write_header:
+                            w.writeheader()
+                            write_header = False
+                        for r in new_rows:
+                            safe = {k: _csv_cell(str(r.get(k, ""))) for k in MAIN_CSV_COLUMNS}
+                            w.writerow(safe)
+                    log.info("→ %s: wrote %s new rows (skipped %s duplicates) to %s", src, len(new_rows), len(rows) - len(new_rows), out_path)
+                else:
+                    log.info("→ %s: all %s rows already in file (duplicates skipped)", src, len(rows))
                 all_rows.extend(rows)
-                mode = "w" if write_header else "a"
-                with open(out_path, mode, newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=MAIN_CSV_COLUMNS, extrasaction="ignore")
-                    if write_header:
-                        w.writeheader()
-                        write_header = False
-                    w.writerows(rows)
-                log.info("→ %s: wrote %s rows to %s", src, len(rows), out_path)
             else:
                 log.warning("%s returned no data", src)
     else:
-        # Single source: run sequentially
-        for src in sources_to_run:
-            log.info("--- %s ---", src)
-            if src == "rumah123":
-                result = run_rumah123(args)
-            elif src == "villa-bali":
-                result = run_villa_bali(args)
-            elif src == "balilongterm":
-                if run_balilongterm is None:
-                    log.warning("skipping balilongterm (scrape_balilongterm not importable)")
+        # Single source: open CSV once, write header, then write each row as it is retrieved
+        with open(out_path, "a" if args.append else "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=MAIN_CSV_COLUMNS, extrasaction="ignore")
+            if write_header:
+                w.writeheader()
+                f.flush()
+            csv_handle = (w, f)
+            for src in sources_to_run:
+                log.info("--- %s ---", src)
+                if src == "rumah123":
+                    result = run_rumah123(args, csv_handle=csv_handle, existing_urls=existing_urls)
+                elif src == "villa-bali":
+                    result = run_villa_bali(args, csv_handle=csv_handle, existing_urls=existing_urls)
+                elif src == "balilongterm":
+                    if run_balilongterm is None:
+                        log.warning("skipping balilongterm (scrape_balilongterm not importable)")
+                        continue
+                    result = run_balilongterm(args)
+                elif src == "balicoconut":
+                    if run_balicoconut is None:
+                        log.warning("skipping balicoconut (scrape_balicoconut not importable)")
+                        continue
+                    result = run_balicoconut(args)
+                elif src == "balihomeimmo":
+                    if run_balihomeimmo is None:
+                        log.warning("skipping balihomeimmo (scrape_balihomeimmo not importable)")
+                        continue
+                    result = run_balihomeimmo(args)
+                else:
                     continue
-                result = run_balilongterm(args)
-            elif src == "balicoconut":
-                if run_balicoconut is None:
-                    log.warning("skipping balicoconut (scrape_balicoconut not importable)")
-                    continue
-                result = run_balicoconut(args)
-            elif src == "balihomeimmo":
-                if run_balihomeimmo is None:
-                    log.warning("skipping balihomeimmo (scrape_balihomeimmo not importable)")
-                    continue
-                result = run_balihomeimmo(args)
-            else:
-                continue
 
-            if result is None:
-                log.warning("%s returned no data", src)
-                continue
-            if isinstance(result, list) and result and isinstance(result[0], str):
-                out_path = Path(args.output).with_suffix(".txt")
-                out_path.write_text("\n".join(result), encoding="utf-8")
-                log.info("wrote %s URLs to %s", len(result), out_path)
-                return
-            rows = result if isinstance(result, list) else []
-            if rows:
-                all_rows.extend(rows)
+                if result is None:
+                    log.warning("%s returned no data", src)
+                    continue
+                if isinstance(result, list) and result and isinstance(result[0], str):
+                    out_path = Path(args.output).with_suffix(".txt")
+                    out_path.write_text("\n".join(result), encoding="utf-8")
+                    log.info("wrote %s URLs to %s", len(result), out_path)
+                    return
+                rows = result if isinstance(result, list) else []
+                if rows:
+                    all_rows.extend(rows)
+                    # BLT/BCL/BHI don't support csv_handle; write only new rows (skip duplicates)
+                    for r in rows:
+                        url = (r.get("url") or "").strip()
+                        if url and url in existing_urls:
+                            continue
+                        safe = {k: _csv_cell(str(r.get(k, ""))) for k in MAIN_CSV_COLUMNS}
+                        w.writerow(safe)
+                        f.flush()
+                        if url:
+                            existing_urls.add(url)
 
     if args.source != "all":
         if not all_rows:
             log.warning("no data collected")
             return
-        with open(out_path, "a" if args.append else "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=MAIN_CSV_COLUMNS, extrasaction="ignore")
-            if write_header:
-                w.writeheader()
-            w.writerows(all_rows)
+        # Rows were already written incrementally to CSV; no bulk write needed
         mode = "appended" if args.append else "wrote"
         log.info("%s %s rows to %s", mode.capitalize(), len(all_rows), out_path)
 
