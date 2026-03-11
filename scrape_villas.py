@@ -10,6 +10,7 @@ import csv
 import json
 import random
 import re
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
@@ -17,9 +18,86 @@ from urllib.parse import urljoin, urlparse, unquote
 import requests
 from bs4 import BeautifulSoup
 
+# ---------------------------------------------------------------------------
+# Proxy rotation: each request uses the next proxy in round-robin order
+# ---------------------------------------------------------------------------
+
+PROXY_SPECS = [
+    {"host": "31.59.20.176", "port": 6754},
+    {"host": "23.95.150.145", "port": 6114},
+    {"host": "198.23.239.134", "port": 6540},
+    {"host": "45.38.107.97", "port": 6014},
+    {"host": "107.172.163.27", "port": 6543},
+    {"host": "198.105.121.200", "port": 6462},
+    {"host": "64.137.96.74", "port": 6641},
+    {"host": "216.10.27.159", "port": 6837},
+    {"host": "142.111.67.146", "port": 5611},
+    {"host": "191.96.254.138", "port": 6185},
+]
+PROXY_USER = "nnfetybf"
+PROXY_PASS = "j0y8vamctfuz"
+
+_proxy_lock = threading.Lock()
+_proxy_index = 0
+_proxyless_mode = False
+
+
+def _next_proxy_for_requests() -> tuple[dict | None, str]:
+    """Return (proxies dict or None for no proxy, ip_display). If proxyless mode, returns (None, 'proxyless')."""
+    global _proxy_index
+    with _proxy_lock:
+        if _proxyless_mode:
+            return None, "proxyless"
+        spec = PROXY_SPECS[_proxy_index % len(PROXY_SPECS)]
+        _proxy_index += 1
+    ip_display = f"{spec['host']}:{spec['port']}"
+    url = f"http://{PROXY_USER}:{PROXY_PASS}@{spec['host']}:{spec['port']}/"
+    return {"http": url, "https": url}, ip_display
+
+
+def _next_proxy_for_playwright() -> tuple[dict | None, str]:
+    """Return (proxy dict or None for no proxy, ip_display). If proxyless mode, returns (None, 'proxyless')."""
+    global _proxy_index
+    with _proxy_lock:
+        if _proxyless_mode:
+            return None, "proxyless"
+        spec = PROXY_SPECS[_proxy_index % len(PROXY_SPECS)]
+        _proxy_index += 1
+    ip_display = f"{spec['host']}:{spec['port']}"
+    proxy = {
+        "server": f"http://{spec['host']}:{spec['port']}",
+        "username": PROXY_USER,
+        "password": PROXY_PASS,
+    }
+    return proxy, ip_display
+
+
 from villa_csv import MAIN_CSV_COLUMNS, get_logger, setup_logging
 
 log = get_logger()
+
+
+def _is_proxy_error(e: BaseException) -> bool:
+    """True if the exception is likely due to proxy/connection failure."""
+    err_str = str(e).lower()
+    if "proxy" in err_str or "err_proxy" in err_str or "connection" in err_str or "timeout" in err_str:
+        return True
+    exc_name = type(e).__name__
+    if exc_name in ("ProxyError", "ConnectTimeout", "ConnectionError", "ReadTimeout", "ConnectError"):
+        return True
+    return False
+
+
+def _switch_to_proxyless() -> None:
+    """Set global proxyless mode and log once. Subsequent requests will not use proxies."""
+    global _proxyless_mode
+    with _proxy_lock:
+        if _proxyless_mode:
+            return
+        _proxyless_mode = True
+    log.warning(
+        "Proxies stopped responding; switching to proxyless mode. Scraping will continue without proxies."
+    )
 
 try:
     from scrape_balilongterm import run_balilongterm
@@ -375,7 +453,12 @@ def rumah123_fetch_listing_links(session: requests.Session, page: int = 1) -> tu
     r = None
     for attempt in range(4):
         try:
-            r = session.get(url, timeout=45, headers=_rumah123_headers())
+            proxies, ip = _next_proxy_for_requests()
+            log.info("rumah123 | listing page %s via proxy %s", page, ip)
+            kwargs = {"timeout": 45, "headers": _rumah123_headers()}
+            if proxies is not None:
+                kwargs["proxies"] = proxies
+            r = session.get(url, **kwargs)
             # Retry up to 3 times with backoff when rate-limited
             for retry in range(3):
                 if r.status_code != 429:
@@ -384,11 +467,35 @@ def rumah123_fetch_listing_links(session: requests.Session, page: int = 1) -> tu
                 wait = 20 + (retry * 15)  # 20s, then 35s, then 50s
                 log.info("rumah123 | 429 rate limit, waiting %ss before retry %s", wait, retry + 1)
                 time.sleep(wait)
-                r = session.get(url, timeout=45, headers=_rumah123_headers())
+                proxies, ip = _next_proxy_for_requests()
+                log.info("rumah123 | listing page %s retry via proxy %s", page, ip)
+                kwargs = {"timeout": 45, "headers": _rumah123_headers()}
+                if proxies is not None:
+                    kwargs["proxies"] = proxies
+                r = session.get(url, **kwargs)
             r.raise_for_status()
             break
         except Exception as e:
-            if attempt < 3:
+            if _is_proxy_error(e):
+                _switch_to_proxyless()
+                try:
+                    log.info("rumah123 | listing page %s retry without proxy", page)
+                    r = session.get(url, timeout=45, headers=_rumah123_headers())
+                    for retry in range(3):
+                        if r.status_code != 429:
+                            break
+                        saw_429 = True
+                        time.sleep(20 + retry * 15)
+                        r = session.get(url, timeout=45, headers=_rumah123_headers())
+                    r.raise_for_status()
+                    break
+                except Exception as e2:
+                    if attempt < 3:
+                        time.sleep(5 * (attempt + 1))
+                    else:
+                        log.warning("rumah123 | page %s failed after retries: %s", page, e2)
+                        return ([], False)
+            elif attempt < 3:
                 time.sleep(5 * (attempt + 1))
             else:
                 log.warning("rumah123 | page %s failed after retries: %s", page, e)
@@ -553,16 +660,42 @@ def rumah123_parse_detail(session: requests.Session, url: str, delay: float = 1.
     time.sleep(delay)
     for attempt in range(3):
         try:
-            r = session.get(url, timeout=45, headers=_rumah123_headers())
+            proxies, ip = _next_proxy_for_requests()
+            log.info("rumah123 | detail page %s via proxy %s", url, ip)
+            kwargs = {"timeout": 45, "headers": _rumah123_headers()}
+            if proxies is not None:
+                kwargs["proxies"] = proxies
+            r = session.get(url, **kwargs)
             for _ in range(2):
                 if r.status_code != 429:
                     break
                 time.sleep(20)
-                r = session.get(url, timeout=45, headers=_rumah123_headers())
+                proxies, ip = _next_proxy_for_requests()
+                log.info("rumah123 | detail page %s retry via proxy %s", url, ip)
+                kwargs = {"timeout": 45, "headers": _rumah123_headers()}
+                if proxies is not None:
+                    kwargs["proxies"] = proxies
+                r = session.get(url, **kwargs)
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
             return _rumah123_soup_to_row(soup, url)
         except Exception as e:
+            if _is_proxy_error(e):
+                _switch_to_proxyless()
+                try:
+                    log.info("rumah123 | detail page %s retry without proxy", url[:80])
+                    r = session.get(url, timeout=45, headers=_rumah123_headers())
+                    for _ in range(2):
+                        if r.status_code != 429:
+                            break
+                        time.sleep(20)
+                        r = session.get(url, timeout=45, headers=_rumah123_headers())
+                    r.raise_for_status()
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    return _rumah123_soup_to_row(soup, url)
+                except Exception as e2:
+                    log.debug("rumah123 | error %s: %s", url[:60], e2)
+                    return None
             if attempt < 2:
                 time.sleep(4 * (attempt + 1))
             else:
@@ -572,7 +705,7 @@ def rumah123_parse_detail(session: requests.Session, url: str, delay: float = 1.
 
 
 def _rumah123_browser(headless: bool = False):
-    """Launch Chromium for Rumah123 (visible by default). Returns (page, browser, playwright)."""
+    """Launch Chromium for Rumah123 (visible by default). Uses next proxy in rotation. Returns (page, browser, playwright, proxy_display)."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -582,14 +715,30 @@ def _rumah123_browser(headless: bool = False):
         headless=headless,
         args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
     )
-    context = browser.new_context(
-        user_agent=_random_user_agent(),
-        locale="id-ID",
-        viewport={"width": 1920, "height": 1080},
-    )
+    proxy, ip_display = _next_proxy_for_playwright()
+    log.info("rumah123 | browser using %s", ip_display)
+    context_options = {
+        "user_agent": _random_user_agent(),
+        "locale": "id-ID",
+        "viewport": {"width": 1920, "height": 1080},
+    }
+    if proxy is not None:
+        context_options["proxy"] = proxy
+    context = browser.new_context(**context_options)
+    # Do not load image contents to reduce bandwidth and speed up scraping.
+    try:
+        context.route(
+            "**/*",
+            lambda route, request: route.abort()
+            if request.resource_type == "image"
+            else route.continue_(),
+        )
+    except Exception:
+        # If routing fails for any reason, continue without image blocking.
+        pass
     context.set_extra_http_headers({"Accept-Language": "id-ID,id;q=0.9,en;q=0.8"})
     page = context.new_page()
-    return page, browser, pw
+    return page, browser, pw, ip_display
 
 
 def _rumah123_show_click_zone_overlay(page) -> None:
@@ -636,7 +785,8 @@ def _rumah123_click_verification_by_position(page) -> bool:
         y_min, y_max = RUMAH123_VERIFICATION_CLICK_Y_MIN, RUMAH123_VERIFICATION_CLICK_Y_MAX
         max_clicks = RUMAH123_VERIFICATION_CLICK_MAX
         _rumah123_show_click_zone_overlay(page)
-        time.sleep(0.5)
+        # Give the verification widget a bit more time (3s extra) before starting the click wave
+        time.sleep(3.5)
         count = 0
         for y in range(y_min, y_max + 1, step):
             for x in range(x_min, x_max + 1, step):
@@ -645,7 +795,7 @@ def _rumah123_click_verification_by_position(page) -> bool:
                 try:
                     page.mouse.click(x, y)
                     count += 1
-                    time.sleep(0.03)
+                    time.sleep(0.036)  # slowed by ~20% vs 0.03s
                 except Exception:
                     pass
             if count >= max_clicks:
@@ -747,8 +897,8 @@ def _rumah123_fetch_listing_in_visible_browser(page_num: int, close_before: tupl
     if not handle:
         log.error("rumah123 | failed to launch visible browser (playwright/chromium may be missing); cannot complete verification")
         return ([], False)
+    page, browser, pw, _ = handle
     log.info("rumah123 | visible browser launched; loading page and applying clicks in widget area")
-    page, browser, pw = handle
     try:
         page.set_extra_http_headers(_rumah123_headers())
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -756,11 +906,12 @@ def _rumah123_fetch_listing_in_visible_browser(page_num: int, close_before: tupl
         log.info("rumah123 | waiting 6s for verification checkbox to appear")
         time.sleep(6)
         start = time.time()
-        while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 15:
+        # Hard cap ~30s total in visible mode for this page
+        while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 10:
             _rumah123_cloudflare_click_if_present(page, headless=False)
             time.sleep(3)
         try:
-            page.wait_for_selector("a[href*='/properti/']", timeout=60_000)
+            page.wait_for_selector("a[href*='/properti/']", timeout=8_000)
         except Exception:
             pass
         time.sleep(2)
@@ -799,8 +950,8 @@ def _rumah123_fetch_detail_in_visible_browser(url: str, close_before: tuple | No
     if not handle:
         log.error("rumah123 | failed to launch visible browser (playwright/chromium may be missing); cannot complete verification")
         return (None, False)
+    page, browser, pw, _ = handle
     log.info("rumah123 | visible browser launched; loading page and applying clicks in widget area")
-    page, browser, pw = handle
     try:
         page.set_extra_http_headers(_rumah123_headers())
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -808,11 +959,12 @@ def _rumah123_fetch_detail_in_visible_browser(url: str, close_before: tuple | No
         log.info("rumah123 | waiting 6s for verification checkbox to appear")
         time.sleep(6)
         start = time.time()
-        while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 15:
+        # Hard cap ~30s total in visible mode for this detail URL
+        while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 10:
             _rumah123_cloudflare_click_if_present(page, headless=False)
             time.sleep(3)
         try:
-            page.wait_for_selector("h1", timeout=60_000)
+            page.wait_for_selector("h1", timeout=8_000)
         except Exception:
             pass
         time.sleep(1)
@@ -874,6 +1026,9 @@ def _rumah123_fetch_listing_playwright(
             html = page.content()
             break
         except Exception as e:
+            if _is_proxy_error(e):
+                _switch_to_proxyless()
+                return ([], False, False, True)
             if attempt < 2:
                 time.sleep(5 * (attempt + 1))
             else:
@@ -899,11 +1054,17 @@ def _rumah123_fetch_detail_playwright(
     page, url: str, delay: float, headless: bool = True, browser_handle: tuple | None = None
 ) -> tuple[dict | None, bool, bool]:
     """Fetch one detail page via Playwright. Returns (parsed_row_or_none, security_blocked, browser_closed).
-    When browser_closed is True, caller must re-acquire headless browser (we closed it to open visible)."""
+    When browser_closed is True, caller must re-acquire headless browser (we closed it to open visible).
+    Overall per-URL safety timeout is ~30s: after that we give up and let the caller continue with next URL."""
     time.sleep(delay)
+    overall_start = time.time()
     security_wait_sec = RUMAH123_SECURITY_RETRY_SEC if headless else 120
     close_before = (browser_handle[1], browser_handle[2]) if browser_handle else None  # (browser, pw)
     for attempt in range(3):
+        # Global safety break: if this URL has already taken ~30s, abort and resume on next one.
+        if time.time() - overall_start > 30:
+            log.warning("rumah123 | detail fetch timeout after 30s for %s; skipping and resuming", url)
+            return (None, False, False)
         try:
             page.set_extra_http_headers(_rumah123_headers())
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -941,6 +1102,9 @@ def _rumah123_fetch_detail_playwright(
             soup = BeautifulSoup(html, "html.parser")
             return (_rumah123_soup_to_row(soup, url), False, False)
         except Exception as e:
+            if _is_proxy_error(e):
+                _switch_to_proxyless()
+                return (None, False, True)
             if attempt < 2:
                 time.sleep(4 * (attempt + 1))
             else:
@@ -991,11 +1155,26 @@ def villa_bali_get_browser(headless: bool = False):
         raise SystemExit("Install playwright: pip install playwright && playwright install chromium")
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
-    context = browser.new_context(
-        user_agent=_random_user_agent(),
-        locale="en-US",
-        viewport={"width": 1920, "height": 1080},
-    )
+    proxy, ip_display = _next_proxy_for_playwright()
+    log.info("villa-bali | browser using %s", ip_display)
+    context_options = {
+        "user_agent": _random_user_agent(),
+        "locale": "en-US",
+        "viewport": {"width": 1920, "height": 1080},
+    }
+    if proxy is not None:
+        context_options["proxy"] = proxy
+    context = browser.new_context(**context_options)
+    # Do not load image contents to reduce bandwidth and speed up scraping.
+    try:
+        context.route(
+            "**/*",
+            lambda route, request: route.abort()
+            if request.resource_type == "image"
+            else route.continue_(),
+        )
+    except Exception:
+        pass
     context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
     page = context.new_page()
     return page, browser, pw
@@ -1204,100 +1383,118 @@ def run_rumah123(
     headless = getattr(args, "headless", True)
     browser_handle = _rumah123_browser(headless=headless)
     if browser_handle is not None:
-        page, browser, pw = browser_handle
+        page, browser, pw, current_proxy = browser_handle
         try:
             log.info("rumah123 | launching browser (headless=%s)", headless)
-            all_links: list[str] = []
-            # Start with the CLI limit; after page 1 we will tighten this based on detected pagination.
+            listing_batch_size = 10
             max_listing_pages = max(1, args.pages)
-            p = 1
+            # Heuristic resume: estimate how many listing pages were already covered from the CSV.
+            # Assume ~20 listings per page; resume from page ~= (existing_rows / 20) + 1.
+            AVG_LISTINGS_PER_PAGE = 20
+            existing_rows = len(seen)
+            if existing_rows:
+                approx_pages_done = max(0, existing_rows // AVG_LISTINGS_PER_PAGE)
+                resume_page = min(max_listing_pages, approx_pages_done + 1)
+            else:
+                resume_page = 1
+            if resume_page > 1:
+                log.info(
+                    "rumah123 | resume: %s existing rows → starting listing pagination from page %s (max %s)",
+                    existing_rows,
+                    resume_page,
+                    max_listing_pages,
+                )
             detected_total_pages: int | None = None
-            while p <= max_listing_pages:
-                if detected_total_pages:
-                    log.info("rumah123 | requesting listing page %s/%s", p, detected_total_pages)
-                else:
-                    log.info("rumah123 | requesting listing page %s (total unknown yet)", p)
-                if p > 1:
-                    time.sleep(listing_sleep)
-                links, ok, _, browser_closed = _rumah123_fetch_listing_playwright(
-                    page, p, listing_sleep, headless=headless, browser_handle=(page, browser, pw)
-                )
-                if browser_closed:
-                    browser_handle = _rumah123_browser(headless=headless)
-                    if not browser_handle:
-                        log.error("rumah123 | failed to re-launch headless browser after visible fetch")
-                        break
-                    page, browser, pw = browser_handle
-                    log.info("rumah123 | re-launched headless browser")
-                if not ok:
-                    time.sleep(8)
-                    p += 1
-                    continue
-                # On the first successfully fetched page, infer the total number of listing pages from pagination.
-                if p == 1 and detected_total_pages is None:
-                    try:
-                        html = page.content()
-                        detected = _rumah123_extract_max_pages_from_html(html)
-                    except Exception:
-                        detected = None
-                    if detected and detected > 0:
-                        detected_total_pages = detected
-                        max_listing_pages = min(args.pages, detected_total_pages)
-                        log.info(
-                            "rumah123 | pagination: detected %s total listing pages; will fetch up to %s (CLI limit %s)",
-                            detected_total_pages,
-                            max_listing_pages,
-                            args.pages,
-                        )
-                if not links:
-                    break
-                before = len(all_links)
-                for link in links:
-                    if link not in all_links:
-                        all_links.append(link)
-                if len(all_links) == before:
-                    # No new links from this page; stop paginating.
-                    break
-                p += 1
-            log.info("rumah123 | collected %s unique property URLs", len(all_links))
-            if not all_links:
-                log.warning("rumah123 | no listing links found")
-                return []
+            p = resume_page
+            all_rows: list[dict] = []
             if args.list_only:
-                return all_links
-            links_to_fetch = [u for u in all_links if u not in seen]
-            skipped = len(all_links) - len(links_to_fetch)
-            if skipped:
-                log.info("rumah123 | skipping %s URLs already in output (resume/duplicate detection)", skipped)
-            if not links_to_fetch:
-                log.info("rumah123 | no new URLs to fetch")
-                return []
-            delay = base_delay
-            log.info(
-                "rumah123 | fetching %s detail pages sequentially (delay ~%ss per URL)",
-                len(links_to_fetch),
-                round(delay, 1),
-            )
-            rows: list[dict] = []
-            total = len(links_to_fetch)
-            for done, url in enumerate(links_to_fetch, 1):
-                if done % 50 == 0 or done == total:
-                    log.info("rumah123 | detail progress %s/%s", done, total)
-                row, _, browser_closed = _rumah123_fetch_detail_playwright(
-                    page, url, delay, headless=headless, browser_handle=(page, browser, pw)
-                )
-                if browser_closed:
-                    browser_handle = _rumah123_browser(headless=headless)
-                    if not browser_handle:
-                        log.error("rumah123 | failed to re-launch headless browser after visible fetch")
+                all_links_list: list[str] = []
+            while p <= max_listing_pages:
+                batch_end = min(p + listing_batch_size - 1, max_listing_pages)
+                log.info("rumah123 | batch: listing pages %s–%s (of max %s)", p, batch_end, max_listing_pages)
+                batch_links: list[str] = []
+                page_num = p
+                while page_num <= batch_end:
+                    if detected_total_pages:
+                        log.info("rumah123 | requesting listing page %s/%s via proxy %s", page_num, detected_total_pages, current_proxy)
+                    else:
+                        log.info("rumah123 | requesting listing page %s (total unknown yet) via proxy %s", page_num, current_proxy)
+                    if page_num > 1:
+                        time.sleep(listing_sleep)
+                    links, ok, _, browser_closed = _rumah123_fetch_listing_playwright(
+                        page, page_num, listing_sleep, headless=headless, browser_handle=(page, browser, pw)
+                    )
+                    if browser_closed:
+                        browser_handle = _rumah123_browser(headless=headless)
+                        if not browser_handle:
+                            log.error("rumah123 | failed to re-launch headless browser after visible fetch")
+                            break
+                        page, browser, pw, current_proxy = browser_handle
+                        log.info("rumah123 | re-launched headless browser (proxy %s)", current_proxy)
+                    if not ok:
+                        time.sleep(8)
+                        page_num += 1
+                        continue
+                    if page_num == 1 and detected_total_pages is None:
+                        try:
+                            html = page.content()
+                            detected = _rumah123_extract_max_pages_from_html(html)
+                        except Exception:
+                            detected = None
+                        if detected and detected > 0:
+                            detected_total_pages = detected
+                            max_listing_pages = min(args.pages, detected_total_pages)
+                            log.info(
+                                "rumah123 | pagination: detected %s total listing pages; will fetch up to %s (CLI limit %s)",
+                                detected_total_pages,
+                                max_listing_pages,
+                                args.pages,
+                            )
+                    if not links:
                         break
-                    page, browser, pw = browser_handle
-                    log.info("rumah123 | re-launched headless browser")
-                if row and _row_has_title_and_price(row, "rumah123"):
-                    flat = flatten_row(row, source="rumah123")
-                    if _write_row_to_csv(csv_handle, flat, seen):
-                        rows.append(flat)
-            return rows
+                    for link in links:
+                        if link not in batch_links:
+                            batch_links.append(link)
+                    page_num += 1
+                log.info("rumah123 | batch: collected %s unique links from pages %s–%s", len(batch_links), p, batch_end)
+                if args.list_only:
+                    all_links_list.extend(batch_links)
+                    p = batch_end + 1
+                    continue
+                links_to_fetch = [u for u in batch_links if u not in seen]
+                skipped = len(batch_links) - len(links_to_fetch)
+                if skipped:
+                    log.info("rumah123 | batch: skipping %s URLs already in output", skipped)
+                if links_to_fetch:
+                    delay = base_delay
+                    total_detail = len(links_to_fetch)
+                    log.info(
+                        "rumah123 | batch: fetching %s detail pages (delay ~%ss)",
+                        total_detail,
+                        round(delay, 1),
+                    )
+                    for done, url in enumerate(links_to_fetch, 1):
+                        if done % 50 == 0 or done == total_detail:
+                            log.info("rumah123 | detail progress %s/%s", done, total_detail)
+                        log.info("rumah123 | detail page %s via proxy %s", url, current_proxy)
+                        row, _, browser_closed = _rumah123_fetch_detail_playwright(
+                            page, url, delay, headless=headless, browser_handle=(page, browser, pw)
+                        )
+                        if browser_closed:
+                            browser_handle = _rumah123_browser(headless=headless)
+                            if not browser_handle:
+                                log.error("rumah123 | failed to re-launch headless browser after visible fetch")
+                                break
+                            page, browser, pw, current_proxy = browser_handle
+                            log.info("rumah123 | re-launched headless browser (proxy %s)", current_proxy)
+                        if row and _row_has_title_and_price(row, "rumah123"):
+                            flat = flatten_row(row, source="rumah123")
+                            if _write_row_to_csv(csv_handle, flat, seen):
+                                all_rows.append(flat)
+                p = batch_end + 1
+            if args.list_only:
+                return list(dict.fromkeys(all_links_list))
+            return all_rows
         finally:
             try:
                 browser.close()
@@ -1309,7 +1506,22 @@ def run_rumah123(
     session = _rumah123_session()
     all_links = []
     pages_fetched = 0
-    for p in range(1, args.pages + 1):
+    # Same heuristic resume for the requests-based fallback.
+    AVG_LISTINGS_PER_PAGE = 20
+    existing_rows = len(seen)
+    if existing_rows:
+        approx_pages_done = max(0, existing_rows // AVG_LISTINGS_PER_PAGE)
+        start_page = min(args.pages, approx_pages_done + 1)
+    else:
+        start_page = 1
+    if start_page > 1:
+        log.info(
+            "rumah123 | resume (requests fallback): %s existing rows → starting from listing page %s (max %s)",
+            existing_rows,
+            start_page,
+            args.pages,
+        )
+    for p in range(start_page, args.pages + 1):
         log.info("rumah123 | requesting listing page %s", p)
         if p > 1:
             time.sleep(listing_sleep)
