@@ -200,6 +200,7 @@ def flatten_row(row: dict, source: str = "rumah123") -> dict:
             "agent_name": (raw.get("agent_name", "") or "").replace(",", ""),
             "updated_by": raw.get("updated_by", ""),
             "main_image": raw.get("main_image", ""),
+            "image_urls": raw.get("image_urls", ""),
             "url": raw.get("url", ""),
         }
     else:
@@ -446,6 +447,86 @@ def _find_text_in_body(soup: BeautifulSoup, pattern):
     return None
 
 
+def _rumah123_normalize_image_url(url: str) -> str:
+    """
+    Normalize Rumah123 image URLs:
+    - Ensure absolute https:// URL
+    - Prefer 1080x720-fit variant when a size segment is present.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not url.startswith("http"):
+        url = "https://" + url.lstrip("/")
+    # Upgrade any size segment (e.g. 720x420-crop, 360x401-inside, 250x160-fit) to 1080x720-fit.
+    url = re.sub(r"/\d+x\d+-(?:crop|fit|inside)/", "/1080x720-fit/", url)
+    return url
+
+
+def _rumah123_extract_images_from_html(html: str, max_images: int = 40) -> list[str]:
+    """
+    Extract a list of image URLs from raw Rumah123 detail HTML.
+
+    Preference order:
+    1) 1080x720-fit images (highest quality slider images present in JSON).
+    2) Slider/thumbnail sizes (e.g. 720x420-crop, 360x401-inside, 250x160-fit).
+    3) Any other pic.rumah123.com / picture.rumah123.com JPG/PNG/WEBP.
+    """
+    if not html:
+        return []
+    try:
+        candidates = re.findall(
+            r"https://(?:pic|picture)\.rumah123\.com/[^\s\"'>)]+",
+            html,
+        )
+    except re.error:
+        return []
+
+    if not candidates:
+        return []
+
+    # Deduplicate while preserving original order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+
+    hi_res: list[str] = []
+    slider_sizes: list[str] = []
+    others: list[str] = []
+
+    for u in unique:
+        ul = u.lower()
+        if not ul.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            continue
+        if "/1080x720-fit/" in ul:
+            hi_res.append(u)
+        elif any(s in ul for s in ("/720x420-crop/", "/360x401-inside/", "/250x160-fit/")):
+            slider_sizes.append(u)
+        else:
+            others.append(u)
+
+    ordered = hi_res + slider_sizes + others
+    normalized: list[str] = []
+    for u in ordered:
+        normalized.append(_rumah123_normalize_image_url(u))
+        if len(normalized) >= max_images:
+            break
+    return normalized
+
+
+def _rumah123_extract_main_image_from_html(html: str) -> str:
+    """
+    Backwards-compatible helper: return only the first/best image URL.
+    """
+    images = _rumah123_extract_images_from_html(html, max_images=1)
+    if not images:
+        return ""
+    return images[0]
+
+
 def rumah123_fetch_listing_links(session: requests.Session, page: int = 1) -> tuple[list[str], bool]:
     """Fetch one listing page. Returns (links, ok). ok=False on network/429 exhaustion so caller can try next page."""
     url = RUMAH123_LISTING if page <= 1 else f"{RUMAH123_LISTING}?page={page}"
@@ -580,7 +661,7 @@ def rumah123_parse_facilities(soup: BeautifulSoup) -> dict:
     return out
 
 
-def _rumah123_soup_to_row(soup: BeautifulSoup, url: str) -> dict:
+def _rumah123_soup_to_row(soup: BeautifulSoup, url: str, html: str | None = None) -> dict:
     """Parse Rumah123 detail page HTML (from requests or Playwright) into a row dict."""
     h1 = soup.find("h1")
     title = h1.get_text(strip=True).replace(",", "") if h1 else ""
@@ -623,9 +704,14 @@ def _rumah123_soup_to_row(soup: BeautifulSoup, url: str) -> dict:
         agent_name = agent_el.get_text(strip=True)
     specs = rumah123_parse_spec_table(soup)
     facilities = rumah123_parse_facilities(soup)
-    main_image = ""
+
+    # Images: collect as many slider/gallery URLs as possible from the raw HTML.
+    image_list: list[str] = _rumah123_extract_images_from_html(html, max_images=40) if html else []
+
+    # Main image: prefer the first from the collected list, then fall back to og:image / first <img>.
+    main_image = image_list[0] if image_list else ""
     og = soup.find("meta", property="og:image")
-    if og and og.get("content") and "picture.rumah123.com" in (og.get("content") or ""):
+    if not main_image and og and og.get("content") and "picture.rumah123.com" in (og.get("content") or ""):
         main_image = (og["content"] or "").strip()
         if "portal-api/image/og" in main_image:
             m = re.search(r"src=([^&\s]+)", main_image)
@@ -639,9 +725,15 @@ def _rumah123_soup_to_row(soup: BeautifulSoup, url: str) -> dict:
             if "picture.rumah123.com" in src and ".jpg" in src:
                 main_image = src if src.startswith("http") else "https://" + src.lstrip("/")
                 break
+
+    main_image = _rumah123_normalize_image_url(main_image)
+    if not image_list and main_image:
+        image_list = [main_image]
+
     return {
         "url": url,
         "main_image": main_image,
+        "image_urls": " | ".join(image_list),
         "title": title,
         "price": price_text,
         "location": location,
@@ -677,8 +769,9 @@ def rumah123_parse_detail(session: requests.Session, url: str, delay: float = 1.
                     kwargs["proxies"] = proxies
                 r = session.get(url, **kwargs)
             r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-            return _rumah123_soup_to_row(soup, url)
+            html = r.text
+            soup = BeautifulSoup(html, "html.parser")
+            return _rumah123_soup_to_row(soup, url, html=html)
         except Exception as e:
             if _is_proxy_error(e):
                 _switch_to_proxyless()
@@ -691,8 +784,9 @@ def rumah123_parse_detail(session: requests.Session, url: str, delay: float = 1.
                         time.sleep(20)
                         r = session.get(url, timeout=45, headers=_rumah123_headers())
                     r.raise_for_status()
-                    soup = BeautifulSoup(r.text, "html.parser")
-                    return _rumah123_soup_to_row(soup, url)
+                    html = r.text
+                    soup = BeautifulSoup(html, "html.parser")
+                    return _rumah123_soup_to_row(soup, url, html=html)
                 except Exception as e2:
                     log.debug("rumah123 | error %s: %s", url[:60], e2)
                     return None
@@ -784,9 +878,14 @@ def _rumah123_click_verification_by_position(page) -> bool:
         x_min, x_max = RUMAH123_VERIFICATION_CLICK_X_MIN, RUMAH123_VERIFICATION_CLICK_X_MAX
         y_min, y_max = RUMAH123_VERIFICATION_CLICK_Y_MIN, RUMAH123_VERIFICATION_CLICK_Y_MAX
         max_clicks = RUMAH123_VERIFICATION_CLICK_MAX
+        url_before = ""
+        try:
+            url_before = page.url or ""
+        except Exception:
+            url_before = ""
         _rumah123_show_click_zone_overlay(page)
-        # Give the verification widget a bit more time (3s extra) before starting the click wave
-        time.sleep(3.5)
+        # Minimal pause so overlay renders before the click wave starts
+        time.sleep(0.3)
         count = 0
         for y in range(y_min, y_max + 1, step):
             for x in range(x_min, x_max + 1, step):
@@ -795,14 +894,26 @@ def _rumah123_click_verification_by_position(page) -> bool:
                 try:
                     page.mouse.click(x, y)
                     count += 1
-                    time.sleep(0.036)  # slowed by ~20% vs 0.03s
+                    # Slow the pace further (~50%% slower than previous 0.06s)
+                    time.sleep(0.09)
                 except Exception:
                     pass
             if count >= max_clicks:
                 break
         if count:
             log.info("rumah123 | verification area: sent %s clicks across widget region", count)
-            time.sleep(2)
+            # Allow the challenge widget and redirect to settle after the full click wave:
+            # wait until the URL changes (challenge solved / redirect), but cap at 16s.
+            wait_start = time.time()
+            while time.time() - wait_start < 16:
+                try:
+                    current_url = page.url or ""
+                except Exception:
+                    current_url = ""
+                if url_before and current_url and current_url != url_before:
+                    log.debug("rumah123 | verification page URL changed after clicks → continuing")
+                    break
+                time.sleep(0.5)
             return True
     except Exception as e:
         log.debug("rumah123 | verification wave click failed: %s", e)
@@ -892,46 +1003,59 @@ def _rumah123_fetch_listing_in_visible_browser(page_num: int, close_before: tupl
         except Exception as e:
             log.debug("rumah123 | closing headless before visible: %s", e)
     url = RUMAH123_LISTING if page_num <= 1 else f"{RUMAH123_LISTING}?page={page_num}"
-    log.warning("rumah123 | verification required: opening temporary VISIBLE browser for listing page %s", page_num)
-    handle = _rumah123_browser(headless=False)
-    if not handle:
-        log.error("rumah123 | failed to launch visible browser (playwright/chromium may be missing); cannot complete verification")
-        return ([], False)
-    page, browser, pw, _ = handle
-    log.info("rumah123 | visible browser launched; loading page and applying clicks in widget area")
-    try:
-        page.set_extra_http_headers(_rumah123_headers())
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        time.sleep(2)
-        log.info("rumah123 | waiting 6s for verification checkbox to appear")
-        time.sleep(6)
-        start = time.time()
-        # Hard cap ~30s total in visible mode for this page
-        while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 10:
-            _rumah123_cloudflare_click_if_present(page, headless=False)
-            time.sleep(3)
+    for attempt in range(2):
+        log.warning("rumah123 | verification required: opening temporary VISIBLE browser for listing page %s (attempt %s)", page_num, attempt + 1)
+        handle = _rumah123_browser(headless=False)
+        if not handle:
+            log.error("rumah123 | failed to launch visible browser (playwright/chromium may be missing); cannot complete verification")
+            return ([], False)
+        page, browser, pw, _ = handle
+        log.info("rumah123 | visible browser launched; loading page and applying clicks in widget area")
+        session_start = time.time()
         try:
-            page.wait_for_selector("a[href*='/properti/']", timeout=8_000)
-        except Exception:
-            pass
-        time.sleep(2)
-        html = page.content()
-    finally:
-        browser.close()
-        pw.stop()
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = (a.get("href") or "").strip()
-        if not href.startswith("/properti/") or "/agent-" in href or "/independent-property-agent/" in href:
-            continue
-        if re.search(r"-(?:hor|vlr)\d+/?$", href):
-            path = href.rstrip("/") + "/" if not href.endswith("/") else href
-            full = urljoin(RUMAH123_BASE, path)
-            if full not in links:
-                links.append(full)
-    log.info("rumah123 | visible browser closed; resuming headless (collected %s links from page %s)", len(links), page_num)
-    return (links, bool(links))
+            page.set_extra_http_headers(_rumah123_headers())
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            # Small settle time, then immediately begin verification checks and click wave if needed.
+            time.sleep(2)
+            start = time.time()
+            # Verification loop; also respect a hard 30s cap for this Chromium session
+            while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 10:
+                if time.time() - session_start > 30:
+                    log.warning("rumah123 | listing visible session >30s on page %s; aborting and relaunching", page_num)
+                    break
+                _rumah123_cloudflare_click_if_present(page, headless=False)
+                time.sleep(3)
+            # After clicks, if the challenge text is still present, kill and relaunch once.
+            html = page.content()
+            html_lower = html.lower()
+            if "verifikasi bahwa anda adalah manusia. ini dapat memerlukan waktu beberapa detik." in html_lower or (time.time() - session_start > 30):
+                log.warning("rumah123 | listing challenge text still present after clicks; closing and relaunching (attempt %s)", attempt + 1)
+                continue
+            try:
+                page.wait_for_selector("a[href*='/properti/']", timeout=8_000)
+            except Exception:
+                pass
+            time.sleep(2)
+            html = page.content()
+            soup = BeautifulSoup(html, "html.parser")
+            links: list[str] = []
+            for a in soup.find_all("a", href=True):
+                href = (a.get("href") or "").strip()
+                if not href.startswith("/properti/") or "/agent-" in href or "/independent-property-agent/" in href:
+                    continue
+                if re.search(r"-(?:hor|vlr)\d+/?$", href):
+                    path = href.rstrip("/") + "/" if not href.endswith("/") else href
+                    full = urljoin(RUMAH123_BASE, path)
+                    if full not in links:
+                        links.append(full)
+            elapsed = time.time() - session_start
+            log.info("rumah123 | visible browser closed; resuming headless (collected %s links from page %s, elapsed %.1fs)", len(links), page_num, elapsed)
+            return (links, bool(links))
+        finally:
+            browser.close()
+            pw.stop()
+    log.warning("rumah123 | visible listing challenge could not be cleared after retries; giving up on page %s", page_num)
+    return ([], False)
 
 
 def _rumah123_fetch_detail_in_visible_browser(url: str, close_before: tuple | None = None) -> tuple[dict | None, bool]:
@@ -945,37 +1069,49 @@ def _rumah123_fetch_detail_in_visible_browser(url: str, close_before: tuple | No
             log.info("rumah123 | closed headless browser before opening visible one")
         except Exception as e:
             log.debug("rumah123 | closing headless before visible: %s", e)
-    log.warning("rumah123 | verification required: opening temporary VISIBLE browser for detail page")
-    handle = _rumah123_browser(headless=False)
-    if not handle:
-        log.error("rumah123 | failed to launch visible browser (playwright/chromium may be missing); cannot complete verification")
-        return (None, False)
-    page, browser, pw, _ = handle
-    log.info("rumah123 | visible browser launched; loading page and applying clicks in widget area")
-    try:
-        page.set_extra_http_headers(_rumah123_headers())
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        time.sleep(2)
-        log.info("rumah123 | waiting 6s for verification checkbox to appear")
-        time.sleep(6)
-        start = time.time()
-        # Hard cap ~30s total in visible mode for this detail URL
-        while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 10:
-            _rumah123_cloudflare_click_if_present(page, headless=False)
-            time.sleep(3)
+    for attempt in range(2):
+        log.warning("rumah123 | verification required: opening temporary VISIBLE browser for detail page (attempt %s)", attempt + 1)
+        handle = _rumah123_browser(headless=False)
+        if not handle:
+            log.error("rumah123 | failed to launch visible browser (playwright/chromium may be missing); cannot complete verification")
+            return (None, False)
+        page, browser, pw, _ = handle
+        log.info("rumah123 | visible browser launched; loading page and applying clicks in widget area")
+        session_start = time.time()
         try:
-            page.wait_for_selector("h1", timeout=8_000)
-        except Exception:
-            pass
-        time.sleep(1)
-        html = page.content()
-        soup = BeautifulSoup(html, "html.parser")
-        row = _rumah123_soup_to_row(soup, url)
-    finally:
-        browser.close()
-        pw.stop()
-    log.info("rumah123 | visible browser closed; resuming headless")
-    return (row, row is not None)
+            page.set_extra_http_headers(_rumah123_headers())
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            # Small settle time, then immediately begin verification checks and click wave if needed.
+            time.sleep(2)
+            start = time.time()
+            # Verification loop; also respect a hard 30s cap for this Chromium session
+            while _rumah123_page_has_verification(page.content().lower()) and (time.time() - start) < 10:
+                if time.time() - session_start > 30:
+                    log.warning("rumah123 | detail visible session >30s for %s; aborting and relaunching", url)
+                    break
+                _rumah123_cloudflare_click_if_present(page, headless=False)
+                time.sleep(3)
+            html = page.content()
+            html_lower = html.lower()
+            if "verifikasi bahwa anda adalah manusia. ini dapat memerlukan waktu beberapa detik." in html_lower or (time.time() - session_start > 30):
+                log.warning("rumah123 | detail challenge text still present after clicks; closing and relaunching (attempt %s)", attempt + 1)
+                continue
+            try:
+                page.wait_for_selector("h1", timeout=8_000)
+            except Exception:
+                pass
+            time.sleep(1)
+            html = page.content()
+            soup = BeautifulSoup(html, "html.parser")
+            row = _rumah123_soup_to_row(soup, url, html=html)
+            elapsed = time.time() - session_start
+            log.info("rumah123 | visible browser closed; resuming headless (elapsed %.1fs for %s)", elapsed, url)
+            return (row, row is not None)
+        finally:
+            browser.close()
+            pw.stop()
+    log.warning("rumah123 | visible detail challenge could not be cleared after retries; giving up on %s", url)
+    return (None, False)
 
 
 def _rumah123_fetch_listing_playwright(
@@ -1100,7 +1236,7 @@ def _rumah123_fetch_detail_playwright(
             time.sleep(1)
             html = page.content()
             soup = BeautifulSoup(html, "html.parser")
-            return (_rumah123_soup_to_row(soup, url), False, False)
+            return (_rumah123_soup_to_row(soup, url, html=html), False, False)
         except Exception as e:
             if _is_proxy_error(e):
                 _switch_to_proxyless()
@@ -1469,28 +1605,34 @@ def run_rumah123(
                     delay = base_delay
                     total_detail = len(links_to_fetch)
                     log.info(
-                        "rumah123 | batch: fetching %s detail pages (delay ~%ss)",
+                        "rumah123 | batch: fetching %s detail pages in sub-batches of 6 (delay ~%ss)",
                         total_detail,
                         round(delay, 1),
                     )
-                    for done, url in enumerate(links_to_fetch, 1):
-                        if done % 50 == 0 or done == total_detail:
-                            log.info("rumah123 | detail progress %s/%s", done, total_detail)
-                        log.info("rumah123 | detail page %s via proxy %s", url, current_proxy)
-                        row, _, browser_closed = _rumah123_fetch_detail_playwright(
-                            page, url, delay, headless=headless, browser_handle=(page, browser, pw)
-                        )
-                        if browser_closed:
-                            browser_handle = _rumah123_browser(headless=headless)
-                            if not browser_handle:
-                                log.error("rumah123 | failed to re-launch headless browser after visible fetch")
-                                break
-                            page, browser, pw, current_proxy = browser_handle
-                            log.info("rumah123 | re-launched headless browser (proxy %s)", current_proxy)
-                        if row and _row_has_title_and_price(row, "rumah123"):
-                            flat = flatten_row(row, source="rumah123")
-                            if _write_row_to_csv(csv_handle, flat, seen):
-                                all_rows.append(flat)
+                    # Process detail pages in groups of 6 (still sequential, but logged 6-by-6)
+                    done = 0
+                    for i in range(0, total_detail, 6):
+                        sub_batch = links_to_fetch[i : i + 6]
+                        log.debug("rumah123 | detail sub-batch %s-%s/%s", i + 1, i + len(sub_batch), total_detail)
+                        for url in sub_batch:
+                            done += 1
+                            if done % 50 == 0 or done == total_detail:
+                                log.info("rumah123 | detail progress %s/%s", done, total_detail)
+                            log.info("rumah123 | detail page %s via proxy %s", url, current_proxy)
+                            row, _, browser_closed = _rumah123_fetch_detail_playwright(
+                                page, url, delay, headless=headless, browser_handle=(page, browser, pw)
+                            )
+                            if browser_closed:
+                                browser_handle = _rumah123_browser(headless=headless)
+                                if not browser_handle:
+                                    log.error("rumah123 | failed to re-launch headless browser after visible fetch")
+                                    break
+                                page, browser, pw, current_proxy = browser_handle
+                                log.info("rumah123 | re-launched headless browser (proxy %s)", current_proxy)
+                            if row and _row_has_title_and_price(row, "rumah123"):
+                                flat = flatten_row(row, source="rumah123")
+                                if _write_row_to_csv(csv_handle, flat, seen):
+                                    all_rows.append(flat)
                 p = batch_end + 1
             if args.list_only:
                 return list(dict.fromkeys(all_links_list))
@@ -1642,8 +1784,17 @@ def main():
     ap.add_argument("--log-file", metavar="PATH", default=None, help="Also write logs to this file (utf-8)")
     ap.add_argument("--resume", action="store_true", default=True, help="Load existing URLs from output file and skip duplicates (default: on)")
     ap.add_argument("--no-resume", action="store_false", dest="resume", help="Disable resume; do not load existing URLs (fetch and write all)")
+    ap.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Disable proxy rotation and run all network calls directly (proxyless mode)",
+    )
     args = ap.parse_args()
     args.headless = not getattr(args, "no_headless", False)  # default: headless True
+
+    # Apply global proxyless mode if requested from CLI.
+    if getattr(args, "no_proxy", False):
+        _switch_to_proxyless()
 
     setup_logging(level=args.log_level, log_file=args.log_file)
     log.info("source=%s output=%s append=%s headless=%s", args.source, args.output, args.append, args.headless)

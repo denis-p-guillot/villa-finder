@@ -31,11 +31,23 @@ python scrape_villas.py -s balicoconut -o villa_listings.csv --append
 python scrape_villas.py -s rumah123 --list-only -o urls.txt
 ```
 
-Common options: `--output` / `-o`, `--append`, `--delay`, `--workers` / `-w`, `--headless`, `--fast`. Entries without title or price are never written.
+Common options: `--output` / `-o`, `--append`, `--delay`, `--headless` / `--no-headless`, `--fast`, `--no-proxy` (see below). Entries without title or price are never written.
 
 **Why there are gaps between log steps:** Scrapers use short delays between listing pages, “load more” clicks, and detail fetches to reduce load and avoid blocks. Use **`--fast`** to shorten those delays when you want a quicker run.
 
-**Faster runs without jeopardizing collection:** Use **`--fast`** (or **`-f`**): it shortens delays for all sources (Rumah123 listing + detail, Bali Home Immo, Bali Long Term, Bali Coconut) and is tuned to keep blocks unlikely. For a bit more speed at slightly higher block risk, you can also pass **`--workers 2`** so each source uses 2 parallel workers for detail fetches (default is 1). Standalone scripts (`scrape_rumah123.py`, `scrape_villa_bali.py`, `scrape_balilongterm.py`, `scrape_balicoconut.py`) remain available and use the same CSV schema.
+**Faster runs without jeopardizing collection:** Use **`--fast`** (or **`-f`**): it shortens delays for all sources (Rumah123 listing + detail, Bali Home Immo, Bali Long Term, Bali Coconut) and is tuned to keep blocks unlikely. `--workers` is kept for CLI compatibility but is ignored in the unified script (detail fetch runs sequentially per source). Standalone scripts (`scrape_rumah123.py`, `scrape_villa_bali.py`, `scrape_balilongterm.py`, `scrape_balicoconut.py`) remain available and use the same CSV schema.
+
+**Anti-blocking & verification handling (Rumah123):**
+
+- Automatically detects Rumah123 / Cloudflare verification pages (“Melakukan verifikasi keamanan”, “Verifikasi bahwa Anda adalah manusia”) and opens a **temporary visible Chromium** only when needed.
+- In the visible browser it:
+  - Waits briefly for the checkbox to appear
+  - Shows a visual overlay of the click zone
+  - Sends a slow, human‑like wave of clicks over the checkbox area
+  - Waits for the URL to change and re-parses the now‑verified page
+- If the challenge text is still present or the visible session stays on the same URL for too long, the helper **kills that browser** and retries once with a fresh session before skipping the URL.
+
+**Proxies:** The unified script supports rotating HTTP(S) proxies for all requests and Playwright browsers. Use **`--no-proxy`** to bypass proxy usage entirely and run all network calls directly (proxyless mode).
 
 **Logging (unified script only):** Use `--log-level DEBUG` for per-URL and retry messages, or `--log-file scrape.log` to write the same logs to a file (utf-8). Example: `python scrape_villas.py -o out.csv --log-level DEBUG --log-file scrape.log`
 
@@ -95,11 +107,14 @@ python scrape_balicoconut.py --list-only -o bcl_urls.txt
 | Option | Description |
 |--------|-------------|
 | `--pages` | Number of listing pages to crawl (default: 1). ~20 listings per page. |
-| `--delay` | Seconds between each detail-page request (default: 3.0). With multiple workers, delay is split across them. |
-| `-w`, `--workers` | Number of parallel workers (default: 2). Lower if you get 429 Too Many Requests. |
+| `--delay` | Seconds between each detail-page request (default: 3.0). |
+| `-w`, `--workers` | Ignored in the unified script (detail fetch runs sequentially); kept for CLI compatibility. |
 | `-o`, `--output` | Output CSV path (default: `villa_listings.csv`). With `--list-only`, writes `.txt`. |
 | `--json` | Also write a JSON file with the same data. |
 | `--list-only` | Only collect property URLs from listing pages; do not fetch details. |
+| `--no-headless` | Run the browser window visibly instead of headless (helpful for manual verification). |
+| `--fast` | Shorter delays for listing/detail fetch; faster but slightly higher block risk. |
+| `--no-proxy` | Disable proxy rotation; all requests and browsers use your direct IP. |
 
 ### Villa-Bali.com options
 

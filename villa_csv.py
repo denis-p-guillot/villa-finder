@@ -61,6 +61,7 @@ MAIN_CSV_COLUMNS = [
     "agent_name",
     "updated_by",
     "main_image",
+    "image_urls",
     "url",
 ]
 
