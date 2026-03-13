@@ -523,6 +523,24 @@ def _rumah123_normalize_image_url(url: str) -> str:
     return url
 
 
+def _rumah123_extract_district_from_json(html: str) -> str:
+    """
+    Extract the district name from the embedded JSON config in the detail page, if present.
+    Example fragment:
+      "location":{"uuid":"...","level":3,"name":"Jimbaran",...,
+                  "district":{"id":"...","name":"Jimbaran",...}, ...}
+    """
+    if not html:
+        return ""
+    try:
+        m = re.search(r'"district"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"', html)
+        if m:
+            return m.group(1).strip()
+    except re.error:
+        return ""
+    return ""
+
+
 def _rumah123_normalize_location(raw_location: str) -> str:
     """
     Given a free-text location like 'Jimbaran, Badung' or 'Villa in Ubud Bali',
@@ -746,18 +764,28 @@ def _rumah123_soup_to_row(soup: BeautifulSoup, url: str, html: str | None = None
     el = _find_text_in_body(soup, re.compile(r"Rp\s*[\d,\.]+", re.I))
     if el:
         price_text = el.strip()
+    # Location: prefer district name from embedded JSON, then fall back to HTML heuristics.
     location = ""
-    for el in soup.find_all(string=re.compile(r"(Canggu|Ubud|Badung|Denpasar|Gianyar|Kerobokan|Seminyak|Sanur|Jimbaran|Tabanan)", re.I)):
-        if el.parent and getattr(el.parent, "name", None) in ("script", "style", "noscript"):
-            continue
-        t = el.strip()
-        # Skip anything that looks like a URL (e.g. "https://www.rumah123.com/...")
-        tl = t.lower()
-        if tl.startswith("http://") or tl.startswith("https://") or "://" in tl:
-            continue
-        if 5 <= len(t) <= 120:
-            location = t
-            break
+    if html:
+        district = _rumah123_extract_district_from_json(html)
+        if district:
+            location = district
+    if not location:
+        for el in soup.find_all(
+            string=re.compile(
+                r"(Abang|Abiansemal|Banjar|Banjarangkan|Bangli|Baturiti|Bebandem|Blahbatuh|Buleleng|Busungbiu|Dawan|Denpasar Barat|Denpasar Selatan|Denpasar Timur|Denpasar Utara|Gerokgak|Gianyar|Jembrana|Karangasem|Kediri|Kerambitan|Kintamani|Klungkung|Kubu|Kubutambahan|Kuta|Kuta Selatan|Kuta Utara|Manggis|Marga|Melaya|Mendoyo|Mengwi|Negara|Nusa Penida|Payangan|Pekutatan|Penebel|Petang|Pupuan|Rendang|Sawan|Selemadeg(?: Barat| Timur)?|Selat|Seririt|Sidemen|Sukawati|Sukasada|Susut|Tabanan|Tampaksiring|Tegallalang|Tejakula|Tembuku|Ubud)",
+                re.I,
+            )
+        ):
+            if el.parent and getattr(el.parent, "name", None) in ("script", "style", "noscript"):
+                continue
+            t = el.strip()
+            tl = t.lower()
+            if tl.startswith("http://") or tl.startswith("https://") or "://" in tl:
+                continue
+            if 3 <= len(t) <= 120:
+                location = t
+                break
     if not location and h1:
         p = h1.find_next(["p", "div", "span"])
         if p:
