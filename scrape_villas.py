@@ -8,10 +8,12 @@ Output: single CSV (villa_listings.csv) with unified columns; only rows with tit
 import argparse
 import csv
 import json
+import queue
 import random
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote, parse_qs, urlencode, urlunparse
 
@@ -1650,6 +1652,10 @@ def _load_existing_urls(path: Path) -> set[str]:
     return urls
 
 
+# Lock for thread-safe CSV writes and existing_urls updates when using parallel detail workers.
+_csv_write_lock = threading.Lock()
+
+
 def _write_row_to_csv(
     csv_handle: tuple | None,
     row: dict,
@@ -1659,19 +1665,21 @@ def _write_row_to_csv(
     If csv_handle is (writer, file), write one row and flush.
     If existing_urls is set and row["url"] (normalized) is already in it, skip write and return False.
     Otherwise write, add normalized url to existing_urls, and return True. Prevents double entries.
+    Thread-safe when multiple workers call this concurrently.
     """
     if csv_handle is None:
         return True
-    url = (row.get("url") or "").strip()
-    key = _normalize_listing_url(url) if url else ""
-    if existing_urls is not None and key and key in existing_urls:
-        return False
-    writer, f = csv_handle
-    writer.writerow(row)
-    f.flush()
-    if existing_urls is not None and key:
-        existing_urls.add(key)
-    return True
+    with _csv_write_lock:
+        url = (row.get("url") or "").strip()
+        key = _normalize_listing_url(url) if url else ""
+        if existing_urls is not None and key and key in existing_urls:
+            return False
+        writer, f = csv_handle
+        writer.writerow(row)
+        f.flush()
+        if existing_urls is not None and key:
+            existing_urls.add(key)
+        return True
 
 
 def run_rumah123(
@@ -1869,16 +1877,25 @@ def run_rumah123(
         log.info("rumah123 | no new URLs to fetch")
         return []
     delay = base_delay
-    log.info("rumah123 | fetching %s detail pages sequentially (delay ~%ss)", len(links_to_fetch), round(delay, 1))
-
+    workers = max(1, getattr(args, "workers", 3))
+    workers = min(workers, len(links_to_fetch))
     rows = []
-    total = len(links_to_fetch)
-    for done, url in enumerate(links_to_fetch, 1):
-        if done % 50 == 0 or done == total:
-            log.info("rumah123 | detail progress %s/%s", done, total)
+
+    def _rumah123_fetch_one(url: str) -> tuple[str, dict | None]:
         try:
             s = _rumah123_session()
-            row = rumah123_parse_detail(s, url, delay=delay)
+            return (url, rumah123_parse_detail(s, url, delay=delay))
+        except Exception as e:
+            log.warning("rumah123 | error %s: %s", url, e)
+            return (url, None)
+
+    if workers <= 1:
+        log.info("rumah123 | fetching %s detail pages sequentially (delay ~%ss)", len(links_to_fetch), round(delay, 1))
+        total = len(links_to_fetch)
+        for done, url in enumerate(links_to_fetch, 1):
+            if done % 50 == 0 or done == total:
+                log.info("rumah123 | detail progress %s/%s", done, total)
+            _, row = _rumah123_fetch_one(url)
             if row and _row_has_title_and_price(row, "rumah123"):
                 log.debug("rumah123 | ok %s", url)
                 flat = flatten_row(row, source="rumah123")
@@ -1886,8 +1903,26 @@ def run_rumah123(
                     rows.append(flat)
             elif row:
                 log.debug("rumah123 | skip (no title/price) %s", url)
-        except Exception as e:
-            log.warning("rumah123 | error %s: %s", url, e)
+    else:
+        log.info("rumah123 | fetching %s detail pages with %s workers (delay ~%ss)", len(links_to_fetch), workers, round(delay, 1))
+        total = len(links_to_fetch)
+        done_count = [0]
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_url = {executor.submit(_rumah123_fetch_one, u): u for u in links_to_fetch}
+            for future in as_completed(future_to_url):
+                url, row = future.result()
+                with _csv_write_lock:
+                    done_count[0] += 1
+                    n = done_count[0]
+                if n % 50 == 0 or n == total:
+                    log.info("rumah123 | detail progress %s/%s", n, total)
+                if row and _row_has_title_and_price(row, "rumah123"):
+                    flat = flatten_row(row, source="rumah123")
+                    if _write_row_to_csv(csv_handle, flat, seen):
+                        rows.append(flat)
+                elif row:
+                    log.debug("rumah123 | skip (no title/price) %s", url)
     return rows
 
 
@@ -1895,7 +1930,7 @@ def run_rumah123(
 # OLX Badung (rent houses/apartments)
 ###############################################################################
 
-OLX_BADUNG_BASE = "https://www.olx.co.id/kab-badung_g4000217/disewakan-rumah-apartemen_c5160"
+OLX_BADUNG_BASE = "https://www.olx.co.id/kab-badung_g4000217/q-villa-rental"
 
 
 def _olx_headers() -> dict:
@@ -1949,18 +1984,8 @@ def olx_get_browser(login_wait: bool = True):
     if proxy is not None:
         context_options["proxy"] = proxy
     context = browser.new_context(**context_options)
-    # For OLX we want to avoid wasting bandwidth and time on CSS, images, and
-    # similar assets; focus on the HTML/document and scripts only.
-    try:
-        context.route(
-            "**/*",
-            lambda route, request: route.abort()
-            if request.resource_type in ("image", "stylesheet", "font")
-            else route.continue_(),
-        )
-    except Exception:
-        # If routing fails for any reason, continue without resource blocking.
-        pass
+    # Let CSS, images, and fonts load so the list page renders fully and the
+    # "Muat lainnya" button and layout are visible.
     context.set_extra_http_headers({"Accept-Language": "id-ID,id;q=0.9,en;q=0.8"})
     page = context.new_page()
 
@@ -1988,49 +2013,190 @@ def olx_get_browser(login_wait: bool = True):
     return page, browser, pw
 
 
+def _olx_extract_item_links_from_html(html: str) -> list[str]:
+    """Parse HTML and return normalized OLX item URLs (/item/...)."""
+    links: list[str] = []
+    seen: set[str] = set()
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href or "/item/" not in href:
+            continue
+        full = urljoin("https://www.olx.co.id", href)
+        try:
+            parsed = urlparse(full)
+            full = parsed._replace(query="").geturl()
+        except Exception:
+            pass
+        if full not in seen:
+            seen.add(full)
+            links.append(full)
+    return links
+
+
+def _olx_wait_page_fully_loaded(page) -> None:
+    """
+    Wait until the OLX listing page is fully loaded before we look for the
+    'Muat lainnya' button: network idle, listing content visible, and a settle
+    period so the full layout (including bottom button) is rendered.
+    """
+    # 1) Wait for load event
+    try:
+        page.wait_for_load_state("load", timeout=30_000)
+    except Exception as e:
+        log.debug("olx-badung | wait load: %s", e)
+
+    # 2) Wait for listing API/content: at least one item link in the DOM
+    try:
+        page.wait_for_selector('a[href*="/item/"]', state="visible", timeout=25_000)
+    except Exception as e:
+        log.debug("olx-badung | wait for first listing link: %s", e)
+
+    # 3) Wait for network to go idle (no requests for 500ms)
+    try:
+        page.wait_for_load_state("networkidle", timeout=25_000)
+    except Exception:
+        pass
+
+    # 4) Poll until we see a reasonable number of listing links (first batch rendered)
+    min_listing_links = 5
+    for _ in range(60):  # up to 30 seconds
+        try:
+            count = page.locator('a[href*="/item/"]').count()
+            if count >= min_listing_links:
+                log.info("olx-badung | listing content ready (%s item links visible)", count)
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        log.debug("olx-badung | continuing after 30s (some listing links may be present)")
+
+    # 5) Short settle; then caller will wait explicitly for the button to appear
+    time.sleep(3)
+
+
+def _olx_scroll_to_bottom(page) -> None:
+    """Scroll to bottom in steps so lazy content at the bottom can render."""
+    for _ in range(14):
+        try:
+            page.evaluate("window.scrollBy(0, 500)")
+            time.sleep(0.4)
+        except Exception:
+            pass
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(1.5)
+    except Exception:
+        pass
+
+
+OLX_LOAD_MORE_SELECTORS = (
+    'button:has-text("Muat lainnya")',
+    'a:has-text("Muat lainnya")',
+    '[data-cy="load-more"]',
+    'button:has-text("Load more")',
+    'a:has-text("Load more")',
+)
+
+
+def _olx_is_load_more_visible(page) -> bool:
+    """Return True if the load-more button is currently visible."""
+    for selector in OLX_LOAD_MORE_SELECTORS:
+        try:
+            if page.locator(selector).first.is_visible(timeout=2000):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _olx_wait_for_load_more_button_visible(page, timeout_sec: int = 120) -> bool:
+    """
+    Poll: scroll to bottom, check if 'Muat lainnya' is visible. Repeat until
+    the button appears or timeout_sec is reached. Return True if button was
+    seen, False if timeout. Only then should we try to click it.
+    """
+    log.info("olx-badung | waiting for 'Muat lainnya' button to appear (polling up to %ss)...", timeout_sec)
+    deadline = time.time() + timeout_sec
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        _olx_scroll_to_bottom(page)
+        if _olx_is_load_more_visible(page):
+            log.info("olx-badung | 'Muat lainnya' button is now visible (after %s attempts)", attempt)
+            return True
+        if attempt % 5 == 0:
+            log.info("olx-badung | still waiting for 'Muat lainnya'... attempt %s", attempt)
+        time.sleep(4)
+    log.warning("olx-badung | 'Muat lainnya' button did not appear after %ss", timeout_sec)
+    return False
+
+
 def olx_fetch_listing_links_playwright(page, max_pages: int = 1) -> list[str]:
     """
     Collect listing detail URLs from the OLX Badung category listing.
 
-    We keep this intentionally simple and robust: just walk listing pages and
-    look for anchors that point to OLX "item" detail URLs.
+    OLX uses a single list page with lazy load: a "Muat lainnya" (Load more)
+    button loads more items. We wait for the page to fully load, scroll in steps
+    to reveal the button, then repeatedly click it and collect links.
     """
     links: list[str] = []
     seen: set[str] = set()
 
-    for page_num in range(1, max_pages + 1):
-        url = OLX_BADUNG_BASE if page_num == 1 else f"{OLX_BADUNG_BASE}?page={page_num}"
+    try:
+        log.info("olx-badung | loading listing page (single URL, load-more strategy)")
+        page.set_extra_http_headers(_olx_headers())
+        page.goto(OLX_BADUNG_BASE, wait_until="load", timeout=60_000)
+        _olx_wait_page_fully_loaded(page)
+        # Only proceed to click after the button has actually appeared (poll up to 2 min)
+        _olx_wait_for_load_more_button_visible(page, timeout_sec=120)
+    except Exception as e:
+        log.warning("olx-badung | listing page failed in browser: %s", e)
+        return links
+
+    load_more_clicks = 0
+    max_clicks = max(1, max_pages)
+    OLX_LOAD_MORE_WAIT_SEC = 4
+    OLX_BUTTON_WAIT_MS = 10_000  # 10s for button to stay visible when we click
+
+    while load_more_clicks < max_clicks:
+        html = page.content()
+        batch = _olx_extract_item_links_from_html(html)
+        for u in batch:
+            if u not in seen:
+                seen.add(u)
+                links.append(u)
+
+        # Scroll to bottom so "Muat lainnya" stays in view
         try:
-            log.info("olx-badung | listing page %s in visible browser", page_num)
-            page.set_extra_http_headers(_olx_headers())
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            for _ in range(4):
-                page.evaluate("window.scrollBy(0, 800)")
-            html = page.content()
-        except Exception as e:
-            log.warning("olx-badung | listing page %s failed in browser: %s", page_num, e)
-            continue
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(1.5)
+        except Exception:
+            pass
 
-        soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if not href:
-                continue
-            # OLX detail pages usually contain "/item/" segments.
-            if "/item/" not in href:
-                continue
-            full = urljoin("https://www.olx.co.id", href)
-            # Normalize tracking query params away for duplicate detection
+        # Find and click "Muat lainnya" (only clicks when button is visible)
+        clicked = False
+        for selector in OLX_LOAD_MORE_SELECTORS:
             try:
-                parsed = urlparse(full)
-                full = parsed._replace(query="").geturl()
+                btn = page.locator(selector).first
+                if btn.is_visible(timeout=OLX_BUTTON_WAIT_MS):
+                    btn.click()
+                    clicked = True
+                    load_more_clicks += 1
+                    log.info("olx-badung | clicked 'Muat lainnya' (click %s/%s), total links so far: %s", load_more_clicks, max_clicks, len(links))
+                    time.sleep(OLX_LOAD_MORE_WAIT_SEC)
+                    if load_more_clicks >= max_clicks:
+                        break
+                    break
             except Exception:
-                pass
-            if full not in seen:
-                seen.add(full)
-                links.append(full)
+                continue
+        if not clicked or load_more_clicks >= max_clicks:
+            if not clicked:
+                log.info("olx-badung | 'Muat lainnya' not visible after %s clicks (page may be fully loaded)", load_more_clicks)
+            break
 
-    log.info("olx-badung | collected %s unique property URLs", len(links))
+    log.info("olx-badung | collected %s unique property URLs (%s load-more clicks)", len(links), load_more_clicks)
     return links
 
 
@@ -2400,10 +2566,10 @@ def run_olx_badung(
     - With --list-only: return a list of URLs.
     - Otherwise: write rows to CSV (if csv_handle set) and return flattened dicts.
     """
-    log.info("olx-badung | starting scrape (pages=%s) using visible Chromium", args.pages)
-    max_pages = max(1, args.pages)
+    log.info("olx-badung | starting scrape (max 'Muat lainnya' clicks=%s) using visible Chromium", args.pages)
+    max_pages = max(1, args.pages)  # for OLX: number of Load-more button clicks, not URL pages
 
-    login_wait = not getattr(args, "olx_skip_login_wait", False)
+    login_wait = not getattr(args, "olx_skip_login_wait", True)
     page, browser, pw = olx_get_browser(login_wait=login_wait)
     try:
         links = olx_fetch_listing_links_playwright(page, max_pages=max_pages)
@@ -2428,6 +2594,20 @@ def run_olx_badung(
         if getattr(args, "fast", False):
             delay = max(1.0, delay * 0.6)
 
+        # From here on we only open detail pages; block CSS/images/fonts to save bandwidth.
+        try:
+            page.context.route(
+                "**/*",
+                lambda route, request: route.abort()
+                if request.resource_type in ("image", "stylesheet", "font")
+                else route.continue_(),
+            )
+            log.info("olx-badung | detail pages: blocking CSS/images/fonts to speed up parsing")
+        except Exception as e:
+            log.debug("olx-badung | could not set resource block for detail pages: %s", e)
+
+        # Playwright sync API is not thread-safe: all page/browser calls must run on the
+        # same thread that created them. So OLX detail fetch is always sequential (1 worker).
         rows: list[dict] = []
         total = len(links_to_fetch)
         for i, url in enumerate(links_to_fetch, 1):
@@ -2443,7 +2623,6 @@ def run_olx_badung(
                 url,
             )
             if _row_has_title_and_price(row, "rumah123"):
-                # Reuse Rumah123 price parser to normalize "Rp ..." into price_idr
                 flat = flatten_row(row, source="rumah123")
                 if _write_row_to_csv(csv_handle, flat, seen):
                     rows.append(flat)
@@ -2488,18 +2667,91 @@ def run_villa_bali(
         if not links_to_fetch:
             log.info("villa-bali | no new URLs to fetch")
             return []
-        log.info("villa-bali | fetching %s detail pages (delay %ss)", len(links_to_fetch), args.delay)
+        workers = max(1, getattr(args, "workers", 3))
+        workers = min(workers, len(links_to_fetch))
         rows = []
-        for i, url in enumerate(links_to_fetch, 1):
-            log.debug("villa-bali | [%s/%s] %s", i, len(links_to_fetch), url)
-            row = villa_bali_parse_detail(page, url, delay=args.delay)
-            if row and _row_has_title_and_price(row, "villa-bali"):
-                flat = flatten_row(row, source="villa-bali")
-                if _write_row_to_csv(csv_handle, flat, seen):
-                    rows.append(flat)
-                    log.debug("villa-bali | ok [%s/%s] %s", i, len(links_to_fetch), url)
+        if workers <= 1:
+            log.info("villa-bali | fetching %s detail pages (delay %ss)", len(links_to_fetch), args.delay)
+            for i, url in enumerate(links_to_fetch, 1):
+                log.debug("villa-bali | [%s/%s] %s", i, len(links_to_fetch), url)
+                row = villa_bali_parse_detail(page, url, delay=args.delay)
+                if row and _row_has_title_and_price(row, "villa-bali"):
+                    flat = flatten_row(row, source="villa-bali")
+                    if _write_row_to_csv(csv_handle, flat, seen):
+                        rows.append(flat)
+                        log.debug("villa-bali | ok [%s/%s] %s", i, len(links_to_fetch), url)
+                else:
+                    log.debug("villa-bali | skip (no title/price) [%s/%s] %s", i, len(links_to_fetch), url)
+        else:
+            pages_list = [page]
+            try:
+                context = page.context
+                for _ in range(workers - 1):
+                    pages_list.append(context.new_page())
+            except Exception as e:
+                log.warning("villa-bali | could not create extra pages, falling back to 1 worker: %s", e)
+                pages_list = [page]
+                workers = 1
+            if workers > 1:
+                log.info("villa-bali | fetching %s detail pages with %s workers (delay %ss)", len(links_to_fetch), workers, args.delay)
+                url_queue: queue.Queue[str | None] = queue.Queue()
+                result_queue: queue.Queue[dict] = queue.Queue()
+                for u in links_to_fetch:
+                    url_queue.put(u)
+                for _ in range(workers):
+                    url_queue.put(None)
+                total = len(links_to_fetch)
+                done_count = [0]
+
+                def villa_bali_worker(worker_page, worker_id: int) -> None:
+                    while True:
+                        u = url_queue.get()
+                        if u is None:
+                            return
+                        with _csv_write_lock:
+                            done_count[0] += 1
+                            n = done_count[0]
+                        if n % 10 == 0 or n == total:
+                            log.info("villa-bali | detail %s/%s (worker %s)", n, total, worker_id)
+                        try:
+                            row = villa_bali_parse_detail(worker_page, u, delay=args.delay)
+                        except Exception as e:
+                            log.warning("villa-bali | worker %s failed for %s: %s", worker_id, u, e)
+                            continue
+                        if row and _row_has_title_and_price(row, "villa-bali"):
+                            flat = flatten_row(row, source="villa-bali")
+                            if _write_row_to_csv(csv_handle, flat, seen):
+                                result_queue.put(flat)
+                                log.debug("villa-bali | ok %s", u)
+                        else:
+                            log.debug("villa-bali | skip (no title/price) %s", u)
+
+                threads = [
+                    threading.Thread(target=villa_bali_worker, args=(pages_list[i], i + 1))
+                    for i in range(workers)
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                while True:
+                    try:
+                        rows.append(result_queue.get_nowait())
+                    except queue.Empty:
+                        break
+                for i in range(1, len(pages_list)):
+                    try:
+                        pages_list[i].close()
+                    except Exception:
+                        pass
+                log.info("villa-bali | parallel detail fetch done: %s rows", len(rows))
             else:
-                log.debug("villa-bali | skip (no title/price) [%s/%s] %s", i, len(links_to_fetch), url)
+                for i, url in enumerate(links_to_fetch, 1):
+                    row = villa_bali_parse_detail(page, url, delay=args.delay)
+                    if row and _row_has_title_and_price(row, "villa-bali"):
+                        flat = flatten_row(row, source="villa-bali")
+                        if _write_row_to_csv(csv_handle, flat, seen):
+                            rows.append(flat)
         return rows
     finally:
         browser.close()
@@ -2522,7 +2774,7 @@ def main():
     ap.add_argument("--append", action="store_true", help="Append to existing CSV")
     ap.add_argument("--list-only", action="store_true", help="Only collect URLs to .txt (single source only)")
     ap.add_argument("--json", action="store_true", help="Also write JSON (Rumah123 only)")
-    ap.add_argument("--workers", "-w", type=int, default=1, help="Ignored; detail fetch runs sequentially (kept for CLI compatibility)")
+    ap.add_argument("--workers", "-w", type=int, default=3, help="Number of concurrent detail-page sessions (default 3). Uses multiple browser pages for OLX/Villa-Bali and parallel requests for Rumah123 fallback.")
     ap.add_argument("--no-headless", action="store_true", help="Run browser visible (default is headless); use if security verification needs to be completed manually")
     ap.add_argument("--fast", "-f", action="store_true", help="Shorter delays for all sources (faster, minimal block risk)")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level (default: INFO)")
@@ -2530,14 +2782,22 @@ def main():
     ap.add_argument("--resume", action="store_true", default=True, help="Load existing URLs from output file and skip duplicates (default: on)")
     ap.add_argument("--no-resume", action="store_false", dest="resume", help="Disable resume; do not load existing URLs (fetch and write all)")
     ap.add_argument(
-        "--no-proxy",
+        "--no-proxy", "-n",
         action="store_true",
+        dest="no_proxy",
         help="Disable proxy rotation and run all network calls directly (proxyless mode)",
     )
     ap.add_argument(
         "--olx-skip-login-wait",
         action="store_true",
-        help="For OLX only: do not wait 60s on the home page before scraping (assumes you're already logged in)",
+        default=True,
+        help="For OLX only: do not wait on the home page before scraping (default: no wait).",
+    )
+    ap.add_argument(
+        "--olx-login-wait",
+        action="store_false",
+        dest="olx_skip_login_wait",
+        help="For OLX only: wait 60s on the home page so you can complete login/verification manually.",
     )
     args = ap.parse_args()
     args.headless = not getattr(args, "no_headless", False)  # default: headless True
