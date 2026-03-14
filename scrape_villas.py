@@ -13,7 +13,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import urljoin, urlparse, unquote, parse_qs, urlencode, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -199,21 +199,44 @@ RUMAH123_BALI_LOCATIONS = [
 
 
 def _parse_price_idr_rumah123(price_text: str) -> tuple[str, str]:
+    """
+    Normalize various Indonesian "Rp ..." price formats into a canonical
+    "Rp X" string and extract rental duration (day/month/year).
+
+    This now also supports plain absolute IDR formats like
+    "Rp 10.550.000.000" (as used by OLX) in addition to Rumah123-style
+    textual amounts such as "Rp 10 miliar", "Rp 15 juta", etc.
+    """
     price_text = (price_text or "").strip()
     duration = ""
+
+    # Extract and strip duration markers such as "/bulan", "per tahun", etc.
+    lower_full = price_text.lower()
     for key, eng in DURATION_MAP.items():
-        if key in price_text.lower():
+        if key in lower_full:
             duration = eng
-            price_text = price_text.lower().split(key)[0].strip()
+            # Keep only the part before the duration marker for numeric parsing.
+            price_text = lower_full.split(key)[0].strip()
             break
-    num_str = re.sub(r"[^\d,\.]", "", price_text).replace(",", ".")
-    if not num_str:
+
+    if not price_text:
         return "", duration
+
+    # Core numeric extraction:
+    # - Accept both "10.550.000.000" and "10,550,000,000" and any mix of
+    #   non-digit separators.
+    digits_only = re.sub(r"[^\d]", "", price_text)
+    if not digits_only:
+        return "", duration
+
     try:
-        amount = float(num_str)
+        amount = int(digits_only)
     except ValueError:
         return "", duration
+
     lower = price_text.lower()
+
+    # Rumah123 textual magnitudes:
     if "miliar" in lower or "milliar" in lower:
         amount *= 1_000_000_000
     elif "juta" in lower:
@@ -221,9 +244,13 @@ def _parse_price_idr_rumah123(price_text: str) -> tuple[str, str]:
     elif "ribu" in lower:
         amount *= 1_000
     else:
+        # Heuristic for bare numbers without magnitude words:
+        # - If the numeric value is very small, treat it as "juta".
+        # - If it's already large (>= 10,000) assume it's the full IDR amount.
         if amount < 10_000:
             amount *= 1_000_000
-    amount_int = int(round(amount))
+
+    amount_int = int(amount)
     return f"Rp {amount_int:,}".replace(",", "."), duration
 
 
@@ -1541,10 +1568,41 @@ def villa_bali_parse_detail(page, url: str, delay: float = 1.0) -> dict | None:
 # Resume & duplicate detection (load existing URLs from CSV/Excel)
 # ---------------------------------------------------------------------------
 
+# Query params we strip so the same listing is one key (e.g. ?ref=... or utm_*)
+_TRACKING_QUERY_PARAMS = frozenset(
+    {"ref", "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"}
+)
+
+
+def _normalize_listing_url(url: str) -> str:
+    """
+    Normalize a listing URL for resume/duplicate detection: strip fragment and
+    tracking query params so the same listing is never treated as two.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    try:
+        parsed = urlparse(u)
+        # Drop fragment
+        netloc = parsed.netloc or ""
+        path = parsed.path.rstrip("/") or "/"
+        # Keep query but drop tracking params
+        q = parse_qs(parsed.query, keep_blank_values=False)
+        for key in list(q):
+            if key.lower() in _TRACKING_QUERY_PARAMS:
+                del q[key]
+        query = urlencode(q, doseq=True) if q else ""
+        return urlunparse((parsed.scheme, netloc, path, parsed.params, query, ""))
+    except Exception:
+        return u
+
+
 def _load_existing_urls(path: Path) -> set[str]:
     """
     Load all existing listing URLs from the output file (CSV or Excel) for resume and duplicate detection.
-    Returns a set of URL strings (strip, non-empty). Returns empty set if file missing or unreadable.
+    Returns a set of *normalized* URL strings. Same listing with different ?ref= or fragment = one entry.
+    Returns empty set if file missing or unreadable.
     """
     if not path.exists():
         return set()
@@ -1558,7 +1616,7 @@ def _load_existing_urls(path: Path) -> set[str]:
                     for row in reader:
                         u = (row.get("url") or "").strip()
                         if u:
-                            urls.add(u)
+                            urls.add(_normalize_listing_url(u))
         elif suffix in (".xlsx", ".xls"):
             try:
                 import openpyxl
@@ -1585,7 +1643,7 @@ def _load_existing_urls(path: Path) -> set[str]:
                     if len(row) > url_col:
                         u = (row[url_col] or "").strip()
                         if isinstance(u, str) and u:
-                            urls.add(u)
+                            urls.add(_normalize_listing_url(u))
             wb.close()
     except Exception as e:
         log.warning("Could not load existing URLs from %s: %s", path, e)
@@ -1599,19 +1657,20 @@ def _write_row_to_csv(
 ) -> bool:
     """
     If csv_handle is (writer, file), write one row and flush.
-    If existing_urls is set and row["url"] is already in it, skip write and return False.
-    Otherwise write, add row["url"] to existing_urls, and return True.
+    If existing_urls is set and row["url"] (normalized) is already in it, skip write and return False.
+    Otherwise write, add normalized url to existing_urls, and return True. Prevents double entries.
     """
     if csv_handle is None:
         return True
     url = (row.get("url") or "").strip()
-    if existing_urls is not None and url in existing_urls:
+    key = _normalize_listing_url(url) if url else ""
+    if existing_urls is not None and key and key in existing_urls:
         return False
     writer, f = csv_handle
     writer.writerow(row)
     f.flush()
-    if existing_urls is not None and url:
-        existing_urls.add(url)
+    if existing_urls is not None and key:
+        existing_urls.add(key)
     return True
 
 
@@ -1709,7 +1768,7 @@ def run_rumah123(
                     all_links_list.extend(batch_links)
                     p = batch_end + 1
                     continue
-                links_to_fetch = [u for u in batch_links if u not in seen]
+                links_to_fetch = [u for u in batch_links if _normalize_listing_url(u) not in seen]
                 skipped = len(batch_links) - len(links_to_fetch)
                 if skipped:
                     log.info("rumah123 | batch: skipping %s URLs already in output", skipped)
@@ -1832,6 +1891,580 @@ def run_rumah123(
     return rows
 
 
+###############################################################################
+# OLX Badung (rent houses/apartments)
+###############################################################################
+
+OLX_BADUNG_BASE = "https://www.olx.co.id/kab-badung_g4000217/disewakan-rumah-apartemen_c5160"
+
+
+def _olx_headers() -> dict:
+    # Reuse random desktop UA pool
+    return {
+        "User-Agent": _random_user_agent(),
+        "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+    }
+
+def olx_get_browser(login_wait: bool = True):
+    """
+    Launch a visible Chromium browser for OLX.
+
+    Headless is explicitly disabled here because OLX quickly blocks headless
+    automation. Interact with the visible window if a verification step appears.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise SystemExit(
+            "Install playwright: pip install playwright && playwright install chromium chrome"
+        )
+    pw = sync_playwright().start()
+
+    # Prefer the locally installed Google Chrome (visible window), falling
+    # back to the bundled Chromium if the Chrome channel is not available.
+    try:
+        browser = pw.chromium.launch(
+            channel="chrome",
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+    except Exception:
+        browser = pw.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+    proxy, ip_display = _next_proxy_for_playwright()
+    log.info("olx-badung | browser using %s", ip_display)
+    context_options = {
+        "user_agent": _random_user_agent(),
+        "locale": "id-ID",
+        "viewport": {"width": 1920, "height": 1080},
+    }
+    if proxy is not None:
+        context_options["proxy"] = proxy
+    context = browser.new_context(**context_options)
+    # For OLX we want to avoid wasting bandwidth and time on CSS, images, and
+    # similar assets; focus on the HTML/document and scripts only.
+    try:
+        context.route(
+            "**/*",
+            lambda route, request: route.abort()
+            if request.resource_type in ("image", "stylesheet", "font")
+            else route.continue_(),
+        )
+    except Exception:
+        # If routing fails for any reason, continue without resource blocking.
+        pass
+    context.set_extra_http_headers({"Accept-Language": "id-ID,id;q=0.9,en;q=0.8"})
+    page = context.new_page()
+
+    # Immediately open OLX in this page so any manual login/captcha you do
+    # is stored in the SAME browser context and will be reused for all
+    # subsequent listing/detail requests.
+    try:
+        log.info("olx-badung | opening OLX home in Chrome for manual login (session will be reused for scraping)")
+        page.goto("https://www.olx.co.id/", wait_until="domcontentloaded", timeout=45000)
+    except Exception as e:
+        log.warning("olx-badung | initial OLX home navigation failed: %s", e)
+
+    # Give you time to complete any manual verification (e.g. login, captcha)
+    # in the visible Chrome window before we start scraping, unless explicitly
+    # disabled via CLI.
+    if login_wait:
+        log.info(
+            "olx-badung | Chrome ready on OLX; waiting 60s so you can complete login/verification"
+        )
+        try:
+            time.sleep(60)
+        except KeyboardInterrupt:
+            log.warning("olx-badung | 60s login wait interrupted; continuing immediately")
+
+    return page, browser, pw
+
+
+def olx_fetch_listing_links_playwright(page, max_pages: int = 1) -> list[str]:
+    """
+    Collect listing detail URLs from the OLX Badung category listing.
+
+    We keep this intentionally simple and robust: just walk listing pages and
+    look for anchors that point to OLX "item" detail URLs.
+    """
+    links: list[str] = []
+    seen: set[str] = set()
+
+    for page_num in range(1, max_pages + 1):
+        url = OLX_BADUNG_BASE if page_num == 1 else f"{OLX_BADUNG_BASE}?page={page_num}"
+        try:
+            log.info("olx-badung | listing page %s in visible browser", page_num)
+            page.set_extra_http_headers(_olx_headers())
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            for _ in range(4):
+                page.evaluate("window.scrollBy(0, 800)")
+            html = page.content()
+        except Exception as e:
+            log.warning("olx-badung | listing page %s failed in browser: %s", page_num, e)
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if not href:
+                continue
+            # OLX detail pages usually contain "/item/" segments.
+            if "/item/" not in href:
+                continue
+            full = urljoin("https://www.olx.co.id", href)
+            # Normalize tracking query params away for duplicate detection
+            try:
+                parsed = urlparse(full)
+                full = parsed._replace(query="").geturl()
+            except Exception:
+                pass
+            if full not in seen:
+                seen.add(full)
+                links.append(full)
+
+    log.info("olx-badung | collected %s unique property URLs", len(links))
+    return links
+
+
+# Timeout for a single listing detail page load; if exceeded, skip to next listing.
+DETAIL_PAGE_TIMEOUT_MS = 30_000
+
+
+def olx_parse_detail_playwright(page, url: str, delay: float = 0.0) -> dict | None:
+    """
+    Fetch and parse a single OLX detail page into our raw row schema, using the
+    already-open visible Chromium page.
+
+    We only rely on very generic HTML patterns (h1 title, Rp price text, a
+    location/breadcrumb area, description and first image) to keep it robust
+    against minor layout changes. If the page does not finish loading within
+    DETAIL_PAGE_TIMEOUT_MS (30s), we skip this listing and return None.
+    """
+    try:
+        page.set_extra_http_headers(_olx_headers())
+        log.info("olx-badung | detail in browser %s", url)
+        # Wait for the full page load; 30s timeout then move to next listing.
+        page.goto(url, wait_until="load", timeout=DETAIL_PAGE_TIMEOUT_MS)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            # If network never fully goes idle, we still proceed with whatever DOM we have.
+            pass
+        try:
+            page.wait_for_selector("h1", timeout=10_000)
+        except Exception:
+            pass
+        try:
+            page.evaluate("window.scrollBy(0, 100)")
+        except Exception:
+            pass
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "timeout" in err_msg or "timed out" in err_msg:
+            log.warning("olx-badung | detail page timeout (30s), skipping: %s", url)
+        else:
+            log.warning("olx-badung | detail failed in browser %s: %s", url, e)
+        return None
+
+    # ------------------------------------------------------------------
+    # Primary data source: structured JSON from window.__APP, via JS
+    # evaluation (avoids brittle regex over HTML/inline scripts).
+    # ------------------------------------------------------------------
+    title = ""
+    price_text = ""
+    location = ""
+    description = ""
+    bedrooms = ""
+    bathrooms = ""
+    land_size_m2 = ""
+    building_size_m2 = ""
+    certificate = ""
+    facilities_list: list[str] = []
+    agent_name = ""
+    agent_phone = ""
+    updated_by = ""
+    main_image = ""
+    image_urls: list[str] = []
+
+    app_obj = None
+    try:
+        # For now we ignore the clickable phone number and just focus on the
+        # structured listing data available in window.__APP. The phone click /
+        # Akamai timing logic can be re-enabled later if needed.
+        app_obj = page.evaluate("() => (window.__APP || null)")
+    except Exception:
+        app_obj = None
+
+    if isinstance(app_obj, dict):
+        try:
+            items_state = (app_obj.get("states") or {}).get("items") or {}
+            elements = items_state.get("elements") or {}
+            ad_obj = None
+            if isinstance(elements, dict) and elements:
+                ad_obj = next(iter(elements.values()))
+            if isinstance(ad_obj, dict):
+                # Title
+                title = (ad_obj.get("title") or ad_obj.get("subject") or title or "").strip()
+
+                # Price → normalized "Rp ..." string
+                price = ad_obj.get("price") or {}
+                if isinstance(price, dict):
+                    raw_val = None
+                    value = price.get("value") or {}
+                    if isinstance(value, dict):
+                        raw_val = value.get("raw") or value.get("value")
+                    if raw_val is None:
+                        raw_val = price.get("raw") or price.get("value")
+                    try:
+                        amount = int(raw_val)
+                        price_text = f"Rp {amount:,}".replace(",", ".")
+                    except Exception:
+                        pass
+                if not price_text and isinstance(price, dict):
+                    # If OLX already has a nice "Rp ..." display string, prefer that.
+                    display = (price.get("display") or "").strip()
+                    if display.startswith("Rp"):
+                        price_text = display
+
+                # Location (simple human label)
+                loc_obj = ad_obj.get("location") or ad_obj.get("locations_resolved") or {}
+                if isinstance(loc_obj, dict):
+                    location = (
+                        loc_obj.get("label")
+                        or loc_obj.get("display_name")
+                        or loc_obj.get("city_name")
+                        or location
+                    ) or ""
+                    location = (location or "").strip()
+
+                # Description
+                description = (ad_obj.get("description") or description or "").strip()
+
+                # Main info string, e.g. "3 KT - 2 KM - 250 m2"
+                main_info = (ad_obj.get("main_info") or "").strip()
+                if main_info:
+                    m_bed = re.search(r"(\d+)\s*KT", main_info, re.I)
+                    if m_bed:
+                        bedrooms = m_bed.group(1)
+                    m_bath = re.search(r"(\d+)\s*KM", main_info, re.I)
+                    if m_bath:
+                        bathrooms = m_bath.group(1)
+                    m_bld = list(re.finditer(r"(\d+)\s*m2", main_info, re.I))
+                    if m_bld:
+                        building_size_m2 = m_bld[-1].group(1)
+
+                # Parameters (land size, certificate, facilities, and possibly beds/baths)
+                params = ad_obj.get("parameters") or []
+                if isinstance(params, list):
+                    for p in params:
+                        if not isinstance(p, dict):
+                            continue
+                        key = (p.get("key") or "").strip()
+                        val = (
+                            p.get("formatted_value")
+                            or p.get("value_text")
+                            or p.get("string_value")
+                            or p.get("value")
+                            or ""
+                        )
+                        val = str(val).strip()
+                        if not key or not val:
+                            continue
+                        if key == "p_sqr_land" and not land_size_m2:
+                            m_land = re.search(r"(\d+)", val)
+                            if m_land:
+                                land_size_m2 = m_land.group(1)
+                        elif key == "p_certificate" and not certificate:
+                            certificate = val
+                        elif key == "p_facility":
+                            facilities_list.append(val)
+                        elif key in ("p_bedroom", "p_bedrooms") and not bedrooms:
+                            m_bed = re.search(r"(\d+)", val)
+                            if m_bed:
+                                bedrooms = m_bed.group(1)
+                        elif key in ("p_bathroom", "p_bathrooms") and not bathrooms:
+                            m_bath = re.search(r"(\d+)", val)
+                            if m_bath:
+                                bathrooms = m_bath.group(1)
+
+                # Agent / user name
+                agent_name = (
+                    ad_obj.get("user_name")
+                    or (ad_obj.get("user") or {}).get("name")
+                    or agent_name
+                    or ""
+                ).strip()
+
+                # If still missing, fall back to the global users state using
+                # the ad's user_id. This is where names like "Destiny Realty"
+                # live for OLX property agents.
+                if not agent_name:
+                    user_id = str(ad_obj.get("user_id") or "").strip()
+                    users_state = (app_obj.get("states") or {}).get("users") or {}
+                    users_elements = users_state.get("elements") or {}
+                    if user_id and isinstance(users_elements, dict):
+                        user_obj = users_elements.get(user_id) or {}
+                        if isinstance(user_obj, dict):
+                            agent_name = (user_obj.get("name") or "").strip() or agent_name
+
+                # Updated-by metadata (best-effort)
+                updated_by = (ad_obj.get("display_date") or updated_by or "").strip()
+
+                # Images
+                imgs = ad_obj.get("images") or []
+                if isinstance(imgs, list):
+                    for img in imgs:
+                        if not isinstance(img, dict):
+                            continue
+                        src = (
+                            img.get("url")
+                            or img.get("big")
+                            or img.get("large")
+                            or img.get("small")
+                            or ""
+                        )
+                        src = str(src).strip()
+                        if not src or not src.startswith("http"):
+                            continue
+                        if src not in image_urls:
+                            image_urls.append(src)
+                    if image_urls and not main_image:
+                        main_image = image_urls[0]
+        except Exception:
+            # If JSON parsing fails for any reason, we'll fall back to HTML below.
+            pass
+
+    # ------------------------------------------------------------------
+    # HTML-based fallbacks for any missing fields
+    # ------------------------------------------------------------------
+    html = page.content()
+
+    # In some anti-bot / edge-cache failure cases OLX serves a raw CSS
+    # asset (e.g. desktop-7904.olx.css) instead of the expected HTML
+    # document for the detail URL. When that happens, page.content() is
+    # just a long CSS blob and our parser sees no <h1> / "Rp ..." price,
+    # which leads to "no data collected" even though the visible browser
+    # might later navigate elsewhere.
+    #
+    # Heuristic: if the DOM snapshot we are about to parse looks non-HTML
+    # (no <html> or <body> tag at all), retry once with a full "load"
+    # wait. If we still don't see an HTML document, log and give up on
+    # this URL so we don't keep logging huge CSS blobs.
+    lower_html = (html or "").lower()
+    if "<html" not in lower_html and "<body" not in lower_html:
+        log.warning(
+            "olx-badung | detail %s content looks non-HTML before parsing "
+            "(len=%s); retrying once with wait_until=load",
+            url,
+            len(html or ""),
+        )
+        try:
+            page.goto(url, wait_until="load", timeout=DETAIL_PAGE_TIMEOUT_MS)
+            html = page.content()
+            lower_html = (html or "").lower()
+        except Exception as e:
+            log.warning(
+                "olx-badung | retry detail load failed for %s: %s", url, e
+            )
+            return None
+
+        if "<html" not in lower_html and "<body" not in lower_html:
+            log.warning(
+                "olx-badung | detail %s still non-HTML after retry; skipping "
+                "this URL (likely CSS/security asset instead of listing)",
+                url,
+            )
+            return None
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    if not title:
+        h1 = soup.find("h1")
+        if h1:
+            title = h1.get_text(strip=True).replace(",", "")
+
+    if not price_text:
+        price_node = soup.find(string=re.compile(r"Rp\s*[\d\.]+", re.I))
+        if price_node:
+            price_text = price_node.strip()
+    # Ensure price_text looks like a real "Rp ..." price; if JSON extraction
+    # accidentally captured non-price content (e.g. a CSS blob), re-scan the
+    # HTML and fall back to a sane value or empty.
+    if price_text and not re.search(r"Rp\s*[\d\.]+", price_text, re.I):
+        price_node = soup.find(string=re.compile(r"Rp\s*[\d\.]+", re.I))
+        if price_node:
+            price_text = price_node.strip()
+        else:
+            price_text = ""
+
+    if not location:
+        loc_candidates = []
+        for el in soup.find_all(string=re.compile(r"Badung|Bali", re.I)):
+            txt = el.strip()
+            if 3 <= len(txt) <= 80:
+                loc_candidates.append(txt)
+        if loc_candidates:
+            location = loc_candidates[0]
+
+    if not description:
+        d_label = soup.find(string=re.compile(r"Deskripsi", re.I))
+        if d_label:
+            parent = d_label.parent
+            while parent and getattr(parent, "name", None) not in ("section", "div"):
+                parent = parent.parent
+            if parent:
+                desc_block = parent.find("p") or parent.find("div")
+                if desc_block:
+                    description = desc_block.get_text(separator=" ", strip=True)
+        if not description:
+            longest = ""
+            for p in soup.find_all("p"):
+                txt = p.get_text(separator=" ", strip=True)
+                if len(txt) > len(longest):
+                    longest = txt
+            description = longest
+
+    if not main_image:
+        for img in soup.find_all("img", src=True):
+            src = (img.get("src") or "").strip()
+            if not src:
+                continue
+            if "olxcdn" in src or "images.olx" in src or src.startswith("http"):
+                main_image = src
+                break
+    if main_image and not image_urls:
+        image_urls = [main_image]
+
+    if not title and not price_text:
+        # Not a valid listing page (maybe removed). Log a short snippet of the
+        # page so we can see what OLX actually returned (e.g. CSS blob,
+        # security wall, etc.) when debugging "no data collected".
+        try:
+            raw_html = page.content()
+            snippet = (raw_html or "")[:1000]
+            log.warning(
+                "olx-badung | empty title+price for %s; first 1000 chars of page:\n%s",
+                url,
+                snippet,
+            )
+        except Exception:
+            pass
+        return None
+
+    # Merge phone into agent_name so it ends up in the canonical CSV column
+    # without changing the shared schema. Format: "Name | PHONE".
+    if agent_phone:
+        if agent_name:
+            agent_name = f"{agent_name} | {agent_phone}"
+        else:
+            agent_name = agent_phone
+
+    row = {
+        "title": title,
+        "price": price_text,
+        "location": location,
+        "description": description,
+        "main_image": main_image,
+        "image_urls": " | ".join(image_urls) if image_urls else "",
+        # Rumah123-style spec keys so flatten_row(source="rumah123") can populate canonical columns
+        "Kamar_Tidur": bedrooms,
+        "Kamar_Mandi": bathrooms,
+        "Luas_Tanah": land_size_m2,
+        "Luas_Bangunan": building_size_m2,
+        "Sertifikat": certificate,
+        # Facilities and agent/update metadata
+        "facilities_rumah": " | ".join(dict.fromkeys(facilities_list)) if facilities_list else "",
+        "agent_name": agent_name,
+        "updated_by": updated_by,
+        "url": url,
+    }
+    return row
+
+
+def run_olx_badung(
+    args,
+    csv_handle: tuple | None = None,
+    existing_urls: set[str] | None = None,
+) -> list[dict] | list[str]:
+    """
+    Scrape OLX Badung category and emit rows in the unified CSV schema.
+
+    - With --list-only: return a list of URLs.
+    - Otherwise: write rows to CSV (if csv_handle set) and return flattened dicts.
+    """
+    log.info("olx-badung | starting scrape (pages=%s) using visible Chromium", args.pages)
+    max_pages = max(1, args.pages)
+
+    login_wait = not getattr(args, "olx_skip_login_wait", False)
+    page, browser, pw = olx_get_browser(login_wait=login_wait)
+    try:
+        links = olx_fetch_listing_links_playwright(page, max_pages=max_pages)
+        if not links:
+            log.warning("olx-badung | no listing links found")
+            return [] if not args.list_only else []
+
+        if args.list_only:
+            # Just return unique URLs so caller can write .txt
+            return list(dict.fromkeys(links))
+
+        seen = existing_urls if existing_urls is not None else set()
+        links_to_fetch = [u for u in links if _normalize_listing_url(u) not in seen]
+        skipped = len(links) - len(links_to_fetch)
+        if skipped:
+            log.info("olx-badung | skipping %s URLs already in output (resume/duplicate detection)", skipped)
+        if not links_to_fetch:
+            log.info("olx-badung | no new URLs to fetch")
+            return []
+
+        delay = getattr(args, "delay", 3.0)
+        if getattr(args, "fast", False):
+            delay = max(1.0, delay * 0.6)
+
+        rows: list[dict] = []
+        total = len(links_to_fetch)
+        for i, url in enumerate(links_to_fetch, 1):
+            log.info("olx-badung | detail %s/%s %s", i, total, url)
+            row = olx_parse_detail_playwright(page, url, delay=delay)
+            if not row:
+                log.debug("olx-badung | skip (parser returned None) %s", url)
+                continue
+            log.debug(
+                "olx-badung | parsed row title=%r price=%r url=%s",
+                row.get("title"),
+                row.get("price"),
+                url,
+            )
+            if _row_has_title_and_price(row, "rumah123"):
+                # Reuse Rumah123 price parser to normalize "Rp ..." into price_idr
+                flat = flatten_row(row, source="rumah123")
+                if _write_row_to_csv(csv_handle, flat, seen):
+                    rows.append(flat)
+                    log.debug("olx-badung | wrote row for %s", url)
+            else:
+                log.warning(
+                    "olx-badung | row missing title or parsable price, skipping: title=%r price=%r url=%s",
+                    row.get("title"),
+                    row.get("price"),
+                    url,
+                )
+
+        return rows
+    finally:
+        try:
+            browser.close()
+            pw.stop()
+        except Exception:
+            pass
+
+
 def run_villa_bali(
     args,
     csv_handle: tuple | None = None,
@@ -1848,7 +2481,7 @@ def run_villa_bali(
             return []
         if args.list_only:
             return links  # caller writes .txt
-        links_to_fetch = [u for u in links if u not in seen]
+        links_to_fetch = [u for u in links if _normalize_listing_url(u) not in seen]
         skipped = len(links) - len(links_to_fetch)
         if skipped:
             log.info("villa-bali | skipping %s URLs already in output (resume/duplicate detection)", skipped)
@@ -1879,7 +2512,7 @@ def main():
     )
     ap.add_argument(
         "--source", "-s",
-        choices=["all", "rumah123", "villa-bali", "balilongterm", "balicoconut", "balihomeimmo"],
+        choices=["all", "rumah123", "villa-bali", "balilongterm", "balicoconut", "balihomeimmo", "olx-badung"],
         default="all",
         help="Source(s) to scrape (default: all)",
     )
@@ -1901,6 +2534,11 @@ def main():
         action="store_true",
         help="Disable proxy rotation and run all network calls directly (proxyless mode)",
     )
+    ap.add_argument(
+        "--olx-skip-login-wait",
+        action="store_true",
+        help="For OLX only: do not wait 60s on the home page before scraping (assumes you're already logged in)",
+    )
     args = ap.parse_args()
     args.headless = not getattr(args, "no_headless", False)  # default: headless True
 
@@ -1911,8 +2549,12 @@ def main():
     setup_logging(level=args.log_level, log_file=args.log_file)
     log.info("source=%s output=%s append=%s headless=%s", args.source, args.output, args.append, args.headless)
 
-    # "all" = Rumah123, BLT, BCL, Bali Home Immo (yearly+monthly)
-    sources_to_run = ["rumah123", "balilongterm", "balicoconut", "balihomeimmo"] if args.source == "all" else [args.source]
+    # "all" = Rumah123, BLT, BCL, Bali Home Immo (yearly+monthly) + OLX Badung
+    sources_to_run = (
+        ["rumah123", "balilongterm", "balicoconut", "balihomeimmo", "olx-badung"]
+        if args.source == "all"
+        else [args.source]
+    )
 
     if args.source == "all" and args.list_only:
         log.error("--list-only is not supported with --source all; pick a single source")
@@ -1925,14 +2567,16 @@ def main():
     use_append = args.append or (getattr(args, "resume", True) and file_exists)
     write_header = not (use_append and file_exists)
 
-    # Resume & duplicate detection (default: on). Load existing URLs from CSV/Excel so we skip them.
+    # Resume & duplicate detection (default: on). Load existing URLs from output CSV/Excel; skip those when fetching and never write the same listing twice.
     if getattr(args, "resume", True):
         existing_urls = _load_existing_urls(out_path)
         if existing_urls:
-            log.info("Resume (default): loaded %s existing URLs from %s; will skip duplicates", len(existing_urls), out_path)
+            log.info("Resume: loaded %s existing URLs from %s (CSV rows). Will skip those when fetching and prevent double entries.", len(existing_urls), out_path)
+        else:
+            log.info("Resume: no existing URLs in %s; starting fresh (duplicate prevention still on).", out_path)
     else:
         existing_urls = set()
-        log.info("Resume disabled (--no-resume); will not skip existing URLs")
+        log.info("Resume disabled (--no-resume); will not skip existing URLs.")
 
     if args.source == "all":
         # Run sources sequentially to limit resource and bandwidth use
@@ -1951,6 +2595,8 @@ def main():
                     result = run_rumah123(args, existing_urls=existing_urls)
                 elif src == "villa-bali":
                     result = run_villa_bali(args, existing_urls=existing_urls)
+                elif src == "olx-badung":
+                    result = run_olx_badung(args, existing_urls=existing_urls)
                 elif src == "balilongterm":
                     result = run_balilongterm(args)
                 elif src == "balicoconut":
@@ -1972,13 +2618,14 @@ def main():
                 return
             rows = result if isinstance(result, list) else []
             if rows:
-                # Skip duplicates: only write rows whose url is not already in existing_urls
+                # Skip duplicates: only write rows whose url (normalized) is not already in existing_urls
                 new_rows = []
                 for r in rows:
                     url = (r.get("url") or "").strip()
-                    if url and url not in existing_urls:
+                    key = _normalize_listing_url(url) if url else ""
+                    if key and key not in existing_urls:
                         new_rows.append(r)
-                        existing_urls.add(url)
+                        existing_urls.add(key)
                 if new_rows:
                     mode = "a" if use_append else "w"
                     with open(out_path, mode, newline="", encoding="utf-8") as f:
@@ -2009,6 +2656,8 @@ def main():
                     result = run_rumah123(args, csv_handle=csv_handle, existing_urls=existing_urls)
                 elif src == "villa-bali":
                     result = run_villa_bali(args, csv_handle=csv_handle, existing_urls=existing_urls)
+                elif src == "olx-badung":
+                    result = run_olx_badung(args, csv_handle=csv_handle, existing_urls=existing_urls)
                 elif src == "balilongterm":
                     if run_balilongterm is None:
                         log.warning("skipping balilongterm (scrape_balilongterm not importable)")
@@ -2041,13 +2690,14 @@ def main():
                     # BLT/BCL/BHI don't support csv_handle; write only new rows (skip duplicates)
                     for r in rows:
                         url = (r.get("url") or "").strip()
-                        if url and url in existing_urls:
+                        key = _normalize_listing_url(url) if url else ""
+                        if key and key in existing_urls:
                             continue
                         safe = {k: _csv_cell(str(r.get(k, ""))) for k in MAIN_CSV_COLUMNS}
                         w.writerow(safe)
                         f.flush()
-                        if url:
-                            existing_urls.add(url)
+                        if key:
+                            existing_urls.add(key)
 
     if args.source != "all":
         if not all_rows:
