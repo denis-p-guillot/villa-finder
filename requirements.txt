@@ -3,3 +3,6 @@ beautifulsoup4>=4.11.0
 playwright>=1.40.0
 # Optional: for resume/duplicate detection from Excel output
 openpyxl>=3.0.0
+openai>=1.6.0
+python-dotenv>=1.0.0
+ddgs>=9.0.0

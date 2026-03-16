@@ -113,6 +113,10 @@ try:
     from scrape_balihomeimmo import run_balihomeimmo
 except ImportError:
     run_balihomeimmo = None
+try:
+    from scrape_balirealty import run_balirealty
+except ImportError:
+    run_balirealty = None
 
 # ---------------------------------------------------------------------------
 # Shared CSV format (canonical columns from villa_csv)
@@ -2764,7 +2768,7 @@ def main():
     )
     ap.add_argument(
         "--source", "-s",
-        choices=["all", "rumah123", "villa-bali", "balilongterm", "balicoconut", "balihomeimmo", "olx-badung"],
+        choices=["all", "rumah123", "villa-bali", "balilongterm", "balicoconut", "balihomeimmo", "olx-badung", "balirealty"],
         default="all",
         help="Source(s) to scrape (default: all)",
     )
@@ -2811,7 +2815,7 @@ def main():
 
     # "all" = Rumah123, BLT, BCL, Bali Home Immo (yearly+monthly) + OLX Badung
     sources_to_run = (
-        ["rumah123", "balilongterm", "balicoconut", "balihomeimmo", "olx-badung"]
+        ["rumah123", "balilongterm", "balicoconut", "balihomeimmo", "olx-badung", "balirealty"]
         if args.source == "all"
         else [args.source]
     )
@@ -2845,6 +2849,7 @@ def main():
             if (s != "balilongterm" or run_balilongterm)
             and (s != "balicoconut" or run_balicoconut)
             and (s != "balihomeimmo" or run_balihomeimmo)
+            and (s != "balirealty" or run_balirealty)
         ]
         if "balihomeimmo" in sources_to_run and run_balihomeimmo is None:
             log.warning("skipping balihomeimmo (scrape_balihomeimmo not importable)")
@@ -2863,6 +2868,8 @@ def main():
                     result = run_balicoconut(args)
                 elif src == "balihomeimmo":
                     result = run_balihomeimmo(args)
+                elif src == "balirealty":
+                    result = run_balirealty(args)
                 else:
                     result = None
             except Exception as e:
@@ -2933,6 +2940,11 @@ def main():
                         log.warning("skipping balihomeimmo (scrape_balihomeimmo not importable)")
                         continue
                     result = run_balihomeimmo(args)
+                elif src == "balirealty":
+                    if run_balirealty is None:
+                        log.warning("skipping balirealty (scrape_balirealty not importable)")
+                        continue
+                    result = run_balirealty(args, csv_handle=csv_handle, existing_urls=existing_urls)
                 else:
                     continue
 
